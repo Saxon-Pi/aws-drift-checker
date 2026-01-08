@@ -164,3 +164,19 @@ Resources:
               "Region : <region>"
               "ResourceId : <resourceId>"
               "Time : <time>"
+  
+###################################
+# Outputs
+###################################
+Outputs:
+  ConfigRuleName:
+    Description: "AWS Config managed rule name for drift detection"
+    Value: !Ref ConfigCfnDriftRule
+    Export:
+      Name: !Sub "${AWS::StackName}-ConfigRuleName"
+
+  SnsTopicArn:
+    Description: "SNS Topic ARN for drift notifications"
+    Value: !Ref SnsCfnDriftTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SnsTopicArn"
