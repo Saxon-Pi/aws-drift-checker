@@ -1,0 +1,187 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Daily weekday 10:00 JST drift reminder (Import ConfigRuleName & SNS Topic ARN from parent stack via Export/ImportValue)"
+
+Parameters:
+  ParentStackName:
+    Type: String
+    Description: "Stack name of the drift detector stack (exports <StackName>-ConfigRuleName and <StackName>-SnsTopicArn)"
+
+Resources:
+  DriftReminderFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ParentStackName}-drift-reminder-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${ParentStackName}-drift-reminder-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # CloudWatch Logs
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+              # Read NON_COMPLIANT resources for the rule
+              - Effect: Allow
+                Action:
+                  - config:GetComplianceDetailsByConfigRule
+                Resource: "*"
+
+              # Publish to SNS topic from parent stack
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  Fn::ImportValue: !Sub "${ParentStackName}-SnsTopicArn"
+
+  DriftReminderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ParentStackName}-drift-reminder"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DriftReminderFunctionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          CONFIG_RULE_NAME:
+            Fn::ImportValue: !Sub "${ParentStackName}-ConfigRuleName"
+          SNS_TOPIC_ARN:
+            Fn::ImportValue: !Sub "${ParentStackName}-SnsTopicArn"
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          from datetime import datetime, timezone
+
+          config = boto3.client("config")
+          sns = boto3.client("sns")
+
+          def _fetch_non_compliant(rule_name: str):
+              token = None
+              results = []
+              while True:
+                  kwargs = {
+                      "ConfigRuleName": rule_name,
+                      "ComplianceTypes": ["NON_COMPLIANT"],
+                      "Limit": 100,
+                  }
+                  if token:
+                      kwargs["NextToken"] = token
+                  resp = config.get_compliance_details_by_config_rule(**kwargs)
+
+                  for ev in resp.get("EvaluationResults", []):
+                      qual = ev.get("EvaluationResultIdentifier", {}).get("EvaluationResultQualifier", {})
+                      rid = qual.get("ResourceId")
+                      rtype = qual.get("ResourceType")
+                      ts = ev.get("ResultRecordedTime")
+                      results.append({
+                          "resourceId": rid,
+                          "resourceType": rtype,
+                          "resultRecordedTime": ts.isoformat() if ts else None,
+                      })
+
+                  token = resp.get("NextToken")
+                  if not token:
+                      break
+              return results
+
+          def handler(event, context):
+              rule_name = os.environ["CONFIG_RULE_NAME"]
+              topic_arn = os.environ["SNS_TOPIC_ARN"]
+
+              non_compliant = _fetch_non_compliant(rule_name)
+
+              if not non_compliant:
+                  print(f"[OK] No NON_COMPLIANT resources for rule={rule_name}")
+                  return {"status": "ok", "nonCompliantCount": 0}
+
+              now = datetime.now(timezone.utc).isoformat()
+
+              lines = []
+              lines.append("CloudFormation Stack のドリフト（非準拠）が検出されています。")
+              lines.append(f"ConfigRuleName: {rule_name}")
+              lines.append(f"CheckedAt(UTC): {now}")
+              lines.append("")
+              lines.append(f"NON_COMPLIANT resources: {len(non_compliant)}")
+              lines.append("")
+
+              for i, item in enumerate(non_compliant, start=1):
+                  lines.append(
+                      f"{i}. {item.get('resourceId')}  "
+                      f"(type={item.get('resourceType')}, recorded={item.get('resultRecordedTime')})"
+                  )
+
+              message = "\n".join(lines)
+
+              sns.publish(
+                  TopicArn=topic_arn,
+                  Subject=f"[Drift Reminder] NON_COMPLIANT: {len(non_compliant)}",
+                  Message=message,
+              )
+
+              return {"status": "notified", "nonCompliantCount": len(non_compliant)}
+
+  DriftReminderScheduleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ParentStackName}-drift-reminder-scheduler-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${ParentStackName}-drift-reminder-scheduler-invoke"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt DriftReminderFunction.Arn
+
+  DriftReminderSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${ParentStackName}-drift-reminder-10am-jst"
+      Description: "Weekdays 10:00 JST - check AWS Config rule and notify if NON_COMPLIANT exists"
+      State: ENABLED
+      ScheduleExpression: "cron(0 10 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: "Asia/Tokyo"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt DriftReminderFunction.Arn
+        RoleArn: !GetAtt DriftReminderScheduleRole.Arn
+
+Outputs:
+  ImportedConfigRuleName:
+    Description: "Imported ConfigRuleName from parent stack export"
+    Value:
+      Fn::ImportValue: !Sub "${ParentStackName}-ConfigRuleName"
+
+  ImportedSnsTopicArn:
+    Description: "Imported SNS Topic ARN from parent stack export"
+    Value:
+      Fn::ImportValue: !Sub "${ParentStackName}-SnsTopicArn"
+
+  DriftReminderFunctionName:
+    Description: "Lambda function name"
+    Value: !Ref DriftReminderFunction
+
+  DriftReminderScheduleName:
+    Description: "Scheduler schedule name"
+    Value: !Ref DriftReminderSchedule
