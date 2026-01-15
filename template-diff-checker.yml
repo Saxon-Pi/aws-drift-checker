@@ -495,7 +495,7 @@ Resources:
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: !Sub |
           {
-            "projectName": "${TemplateSyncProject}"
+            "ProjectName": "${TemplateSyncProject}"
           }
 
 Outputs:
