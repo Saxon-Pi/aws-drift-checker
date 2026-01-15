@@ -1,0 +1,21 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Test template: S3 bucket with Versioning enabled"
+
+Resources:
+  TestBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Suspended
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Purpose
+          Value: cfn-template-diff-check
+
+Outputs:
+  BucketName:
+    Value: !Ref TestBucket
