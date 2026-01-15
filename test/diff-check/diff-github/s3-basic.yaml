@@ -1,0 +1,19 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Test template: basic S3 bucket (no BucketName, minimal cost)"
+
+Resources:
+  TestBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Purpose
+          Value: cfn-template-diff-check
+
+Outputs:
+  BucketName:
+    Value: !Ref TestBucket
