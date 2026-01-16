@@ -29,24 +29,29 @@ def stack_name_from_template(tpath: str) -> str:
     return f"{STACK_PREFIX}-{ENV}-{name}"
 
 def get_cfn_template(stack_name: str):
-    cmd = [
-        "aws", "cloudformation", "get-template",
-        "--stack-name", stack_name,
-        "--output", "json"
-    ]
+    cmd = ["aws", "cloudformation", "get-template", "--stack-name", stack_name, "--output", "json"]
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
-        raise RuntimeError(p.stderr.strip())
+        raise RuntimeError(f"get-template failed for {stack_name}: {p.stderr.strip()}")
 
     data = json.loads(p.stdout)
     body = data.get("TemplateBody")
 
+    # TemplateBody が dict ならそのまま返す
+    if isinstance(body, dict):
+        return body
+
+    # TemplateBody が str の場合：
+    # - JSON文字列なら JSON として読む
+    # - YAML文字列なら cfn_flip で読む（!Ref なども解釈される）
     if isinstance(body, str):
+        body = body.strip()
         try:
             return json.loads(body)
         except Exception:
-            return body
-    return body
+            return load_yaml(body)
+
+    raise RuntimeError(f"Unexpected TemplateBody type: {type(body)}")
 
 meta = {
     "checkedAtUtc": datetime.datetime.utcnow().isoformat() + "Z",
@@ -63,12 +68,12 @@ for tpath in TEMPLATE_LIST:
     with open(tpath, "r", encoding="utf-8") as f:
         gh_obj = load_yaml(f.read())
     gh_canon = canonical_json(gh_obj)
-    (GH_DIR / f"{name}.json").write_text(gh_canon, encoding="utf-8")
+    (GH_DIR / f"{name}.json").write_text(gh_canon + "\n", encoding="utf-8")
 
     # CFN template
     cfn_obj = get_cfn_template(stack)
-    cfn_canon = cfn_obj if isinstance(cfn_obj, str) else canonical_json(cfn_obj)
-    (CFN_DIR / f"{name}.json").write_text(cfn_canon, encoding="utf-8")
+    cfn_canon = canonical_json(cfn_obj)  # 文字列分岐は消す
+    (CFN_DIR / f"{name}.json").write_text(cfn_canon + "\n", encoding="utf-8")
 
     meta["items"].append({
         "template": tpath,

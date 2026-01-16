@@ -201,7 +201,7 @@ Resources:
                 - 'echo "S3: s3://${S3_BUCKET}/${S3_PREFIX}"'
             build:
               commands:
-                - set -euo pipefail
+                - set -eu
                 - git checkout "${GITHUB_BRANCH}"
                 - python3 scripts/collect_and_compare.py
           cache:
