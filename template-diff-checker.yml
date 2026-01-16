@@ -195,106 +195,17 @@ Resources:
                 - pip3 install --quiet cfn-flip
             pre_build:
               commands:
-                - echo "Repo: ${GITHUB_OWNER}/${GITHUB_REPO}"
-                - echo "Branch: ${GITHUB_BRANCH}"
-                - echo "Templates: ${TEMPLATE_LIST}"
-                - echo "S3: s3://${S3_BUCKET}/${S3_PREFIX}"
+                - 'echo "Repo: ${GITHUB_OWNER}/${GITHUB_REPO}"'
+                - 'echo "Branch: ${GITHUB_BRANCH}"'
+                - 'echo "Templates: ${TEMPLATE_LIST}"'
+                - 'echo "S3: s3://${S3_BUCKET}/${S3_PREFIX}"'
             build:
               commands:
                 - set -euo pipefail
                 - git checkout "${GITHUB_BRANCH}"
-
-                # Generate canonical JSON for GitHub templates and CFN stack templates
-                - python3 - <<'PY'
-                  import os, json, pathlib, hashlib, datetime, subprocess
-                  from cfn_flip import load_yaml  # understands CFN tags like !Ref, !Sub, etc.
-
-                  templates = [t.strip() for t in os.environ["TEMPLATE_LIST"].split(",") if t.strip()]
-                  env = os.environ["GITHUB_BRANCH"]
-                  stack_prefix = os.environ["STACK_PREFIX"]
-
-                  out_root = pathlib.Path("/tmp/out")
-                  gh_dir = out_root / "github"
-                  cfn_dir = out_root / "cfn"
-                  gh_dir.mkdir(parents=True, exist_ok=True)
-                  cfn_dir.mkdir(parents=True, exist_ok=True)
-
-                  def canonical_json(obj) -> str:
-                      # stable JSON (keys sorted, no whitespace noise)
-                      return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-
-                  def stack_name_from_template(tpath: str) -> str:
-                      base = tpath.split("/")[-1]
-                      name = base.rsplit(".", 1)[0]
-                      return f"{stack_prefix}-{env}-{name}"
-
-                  def aws_get_template(stack_name: str) -> object:
-                      # get TemplateBody via AWS CLI (safer than boto in buildspec)
-                      cmd = ["aws", "cloudformation", "get-template", "--stack-name", stack_name, "--output", "json"]
-                      p = subprocess.run(cmd, check=False, capture_output=True, text=True)
-                      if p.returncode != 0:
-                          raise RuntimeError(p.stderr.strip() or f"get-template failed for {stack_name}")
-                      data = json.loads(p.stdout)
-                      body = data.get("TemplateBody")
-                      # CLI usually returns TemplateBody as object or JSON string.
-                      if isinstance(body, str):
-                          # Try parse JSON string
-                          try:
-                              return json.loads(body)
-                          except Exception:
-                              # If it is YAML/plain, keep as string (rare). We'll compare as-is.
-                              return body
-                      return body
-
-                  meta = {
-                      "checkedAtUtc": datetime.datetime.utcnow().isoformat() + "Z",
-                      "repo": f"{os.environ.get('GITHUB_OWNER')}/{os.environ.get('GITHUB_REPO')}",
-                      "branch": env,
-                      "items": []
-                  }
-
-                  for tpath in templates:
-                      stack = stack_name_from_template(tpath)
-                      base = tpath.split("/")[-1]
-                      name = base.rsplit(".", 1)[0]
-
-                      # GitHub template -> CFN-aware parse -> canonical JSON
-                      with open(tpath, "r", encoding="utf-8") as f:
-                          gh_obj = load_yaml(f.read())
-                      gh_canon = canonical_json(gh_obj)
-                      gh_path = gh_dir / f"{name}.json"
-                      gh_path.write_text(gh_canon, encoding="utf-8")
-
-                      # CFN template -> canonical JSON
-                      cfn_obj = aws_get_template(stack)
-                      if isinstance(cfn_obj, str):
-                          # rare fallback: keep raw string
-                          cfn_canon = cfn_obj
-                      else:
-                          cfn_canon = canonical_json(cfn_obj)
-                      cfn_path = cfn_dir / f"{name}.json"
-                      cfn_path.write_text(cfn_canon, encoding="utf-8")
-
-                      meta["items"].append({
-                          "templatePath": tpath,
-                          "templateBase": name,
-                          "stackName": stack,
-                          "githubSha256": hashlib.sha256(gh_canon.encode("utf-8")).hexdigest(),
-                          "cfnSha256": hashlib.sha256(cfn_canon.encode("utf-8")).hexdigest(),
-                          "equal": gh_canon == cfn_canon
-                      })
-
-                      print(f"[OK] {name}: stack={stack} equal={meta['items'][-1]['equal']}")
-
-                  (out_root / "_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-                  print(json.dumps(meta, ensure_ascii=False, indent=2))
-                  PY
-
-                # Upload to S3
-                - |
-                  aws s3 cp "/tmp/out/_meta.json" "s3://${S3_BUCKET}/${S3_PREFIX}_meta.json"
-                  aws s3 cp "/tmp/out/github/" "s3://${S3_BUCKET}/${S3_PREFIX}github/" --recursive
-                  aws s3 cp "/tmp/out/cfn/" "s3://${S3_BUCKET}/${S3_PREFIX}cfn/" --recursive
+                - python3 scripts/collect_and_compare.py
+          cache:
+            paths: []
 
   ###################################
   # Lambda: Compare S3 canonical JSONs and notify SNS
@@ -495,7 +406,7 @@ Resources:
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: !Sub |
           {
-            "projectName": "${TemplateSyncProject}"
+            "ProjectName": "${TemplateSyncProject}"
           }
 
 Outputs:
