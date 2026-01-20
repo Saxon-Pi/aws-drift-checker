@@ -126,26 +126,36 @@ Resources:
             install:
               commands:
                 - |
-                  set -euo pipefail
+                  echo "SHELL=$SHELL"
+                  ls -l /bin/sh || true
+                  /bin/sh --version || true
+                  command -v bash || true
+                  cat /etc/os-release || true
+
+                  set -eu
+
                   if command -v yum >/dev/null 2>&1; then
                     yum -y install jq git
                   elif command -v dnf >/dev/null 2>&1; then
                     dnf -y install jq git
                   elif command -v apt-get >/dev/null 2>&1; then
+                    export DEBIAN_FRONTEND=noninteractive
                     apt-get update -y
                     apt-get install -y jq git
                   else
                     echo "ERROR: No supported package manager found (yum/dnf/apt-get)."
                     exit 1
                   fi
-                - aws --version
-                - jq --version || true
-                - git --version || true
+
+                  # sanity check
+                  aws --version || true
+                  git --version
+                  jq --version
 
             pre_build:
               commands:
                 - |
-                  set -euo pipefail
+                  set -eu
 
                   echo "GIT_REF=${GIT_REF:-}"
                   echo "TEMPLATE_PATH=${TEMPLATE_PATH:-}"
@@ -201,7 +211,7 @@ Resources:
               commands:
                 - aws cloudformation validate-template --template-body "file://$TEMPLATE_FILE"
                 - |
-                  set -euo pipefail
+                  set -eu
 
                   # Determine CREATE or UPDATE
                   if aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1; then
