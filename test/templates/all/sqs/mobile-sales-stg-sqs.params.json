@@ -1,6 +1,7 @@
 {
   "ProjectName": "mobile-sales",
-  "Environment": "product",
+  "Environment": "stg",
   "QueueName": "",
-  "MessageRetentionSeconds": 345600
+  "MessageRetentionSeconds": 345600,
+  "TemplateVersion": "v1"
 }

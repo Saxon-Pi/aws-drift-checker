@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "Test template v2: create an SQS queue and update-friendly tags."
+Description: "Test template: create an SQS queue for CodeBuild/ChangeSet pipeline validation."
 
 Parameters:
   ProjectName:
@@ -11,7 +11,6 @@ Parameters:
       - product
       - staging
       - staging2
-      - stg
     Description: "Environment label used in tags."
   QueueName:
     Type: String
@@ -23,10 +22,6 @@ Parameters:
     MinValue: 60
     MaxValue: 1209600
     Description: "SQS message retention seconds (default: 4 days)."
-  TemplateVersion:
-    Type: String
-    Default: "v1"
-    Description: "Bump this value to create a visible stack update (tag change)."
 
 Conditions:
   HasQueueName: !Not [!Equals [!Ref QueueName, ""]]
@@ -44,8 +39,6 @@ Resources:
           Value: !Ref Environment
         - Key: ManagedBy
           Value: "CloudFormation"
-        - Key: TemplateVersion
-          Value: !Ref TemplateVersion
 
 Outputs:
   QueueUrl:
