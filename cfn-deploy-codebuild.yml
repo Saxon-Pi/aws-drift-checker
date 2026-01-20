@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CodeBuild-only deployer that clones a GitHub repo via Deploy Key (SSH),
+  and creates a CloudFormation Change Set (no execute).
+  Template path, params json filename, git ref, and stack name are required at build start.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cfn-changeset-deployer
+    Description: CodeBuild project name.
+
+  GithubSshRepo:
+    Type: String
+    Description: Git SSH URL (e.g., git@github.com:ORG/REPO.git)
+
+  DeployKeySsmParamName:
+    Type: String
+    Default: /cfn-deployer/github/deploykey
+    Description: SSM SecureString parameter name that stores the private deploy key.
+
+Resources:
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${ProjectName}
+      RetentionInDays: 30
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # --- CloudWatch Logs ---
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}:*
+
+              # --- Read deploy key from SSM SecureString ---
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DeployKeySsmParamName}
+
+              # SecureString decryption (if using CMK, scope this to that key ARN)
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: "*"
+
+              # --- CloudFormation (Change Set create + inspection only) ---
+              - Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ListStacks
+                Resource: "*"
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref ProjectName
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Type: PLAINTEXT
+            Value: !Ref AWS::Region
+
+          - Name: DEPLOY_KEY_SSM_PARAM
+            Type: PLAINTEXT
+            Value: !Ref DeployKeySsmParamName
+
+          - Name: GIT_SSH_REPO
+            Type: PLAINTEXT
+            Value: !Ref GithubSshRepo
+
+          # Required at build start:
+          - Name: GIT_REF
+            Type: PLAINTEXT
+            Value: ""
+          - Name: TEMPLATE_PATH
+            Type: PLAINTEXT
+            Value: ""
+          - Name: PARAM_JSON
+            Type: PLAINTEXT
+            Value: ""
+          - Name: STACK_NAME
+            Type: PLAINTEXT
+            Value: ""
+
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CodeBuildLogGroup
+          StreamName: build-log
+
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+
+          phases:
+            install:
+              commands:
+                - yum -y install jq git
+                - aws --version
+                - jq --version
+                - git --version
+
+            pre_build:
+              commands:
+                - echo "GIT_REF=$GIT_REF"
+                - echo "TEMPLATE_PATH=$TEMPLATE_PATH"
+                - echo "PARAM_JSON=$PARAM_JSON"
+                - echo "STACK_NAME=$STACK_NAME"
+                - |
+                  missing=""
+                  [ -z "$GIT_REF" ] && missing="$missing GIT_REF"
+                  [ -z "$TEMPLATE_PATH" ] && missing="$missing TEMPLATE_PATH"
+                  [ -z "$PARAM_JSON" ] && missing="$missing PARAM_JSON"
+                  [ -z "$STACK_NAME" ] && missing="$missing STACK_NAME"
+                  if [ -n "$missing" ]; then
+                    echo "ERROR: Missing required variables:$missing"
+                    echo "Example:"
+                    echo "  GIT_REF=main"
+                    echo "  TEMPLATE_PATH=cfn/templates/all/alb-alarm/alb-alarm.yaml"
+                    echo "  PARAM_JSON=mobile-sales-product-alb-alarm.params.json"
+                    echo "  STACK_NAME=mobile-sales-product-alb-alarm"
+                    exit 1
+                  fi
+
+                # ---- Configure SSH deploy key ----
+                - mkdir -p ~/.ssh
+                - aws ssm get-parameter --name "$DEPLOY_KEY_SSM_PARAM" --with-decryption --query 'Parameter.Value' --output text > ~/.ssh/id_rsa
+                - chmod 600 ~/.ssh/id_rsa
+                - ssh-keyscan -t rsa github.com >> ~/.ssh/known_hosts
+                - eval "$(ssh-agent -s)"
+                - ssh-add ~/.ssh/id_rsa
+
+                # ---- Clone repo ----
+                - rm -rf repo
+                - git clone --depth 1 --branch "$GIT_REF" "$GIT_SSH_REPO" repo
+                - cd repo
+
+                # ---- Resolve template + params (same directory) ----
+                - TEMPLATE_FILE="$TEMPLATE_PATH"
+                - |
+                  # Normalize: allow TEMPLATE_PATH either with or without leading "./"
+                  TEMPLATE_FILE="${TEMPLATE_FILE#./}"
+
+                - |
+                  [ -f "$TEMPLATE_FILE" ] || (echo "ERROR: template not found: $TEMPLATE_FILE" && exit 1)
+
+                - TEMPLATE_DIR="$(dirname "$TEMPLATE_FILE")"
+                - PARAM_FILE="$TEMPLATE_DIR/$PARAM_JSON"
+                - |
+                  [ -f "$PARAM_FILE" ] || (echo "ERROR: params json not found: $PARAM_FILE" && exit 1)
+
+                - CHANGESET_NAME="${STACK_NAME}-cs-$(date +%Y%m%d%H%M%S)"
+                - echo "CHANGESET_NAME=$CHANGESET_NAME"
+                - echo "TEMPLATE_FILE=$TEMPLATE_FILE"
+                - echo "PARAM_FILE=$PARAM_FILE"
+
+                # ---- Convert params.json (object) to CFN parameters array ----
+                # Expected params.json format: { "ParamA": "value", "ParamB": "value2" }
+                - jq -c 'to_entries|map({ParameterKey:.key,ParameterValue:(.value|tostring)})' "$PARAM_FILE" > /tmp/params.cfn.json
+                - cat /tmp/params.cfn.json
+
+            build:
+              commands:
+                - aws cloudformation validate-template --template-body "file://$TEMPLATE_FILE"
+
+                # Determine CREATE or UPDATE
+                - |
+                  if aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1; then
+                    CHANGESET_TYPE="UPDATE"
+                  else
+                    CHANGESET_TYPE="CREATE"
+                  fi
+                  echo "CHANGESET_TYPE=$CHANGESET_TYPE"
+
+                # Create Change Set (NO execute)
+                - |
+                  aws cloudformation create-change-set \
+                    --stack-name "$STACK_NAME" \
+                    --template-body "file://$TEMPLATE_FILE" \
+                    --change-set-name "$CHANGESET_NAME" \
+                    --change-set-type "$CHANGESET_TYPE" \
+                    --parameters "file:///tmp/params.cfn.json" \
+                    --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
+
+                # Wait until change set is created (so describe is stable)
+                - aws cloudformation wait change-set-create-complete --stack-name "$STACK_NAME" --change-set-name "$CHANGESET_NAME"
+
+                - aws cloudformation describe-change-set --stack-name "$STACK_NAME" --change-set-name "$CHANGESET_NAME"
+
+                - echo "DONE: Change Set created (not executed)."
+                - echo "To execute manually (if needed):"
+                - echo "aws cloudformation execute-change-set --stack-name $STACK_NAME --change-set-name $CHANGESET_NAME"
+
+Outputs:
+  CodeBuildProjectName:
+    Value: !Ref ProjectName
+  CodeBuildRoleArn:
+    Value: !GetAtt CodeBuildServiceRole.Arn
+  LogGroupName:
+    Value: !Ref CodeBuildLogGroup

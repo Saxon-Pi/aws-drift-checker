@@ -1,0 +1,6 @@
+{
+  "ProjectName": "mobile-sales",
+  "Environment": "product",
+  "QueueName": "",
+  "MessageRetentionSeconds": 345600
+}

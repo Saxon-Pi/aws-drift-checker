@@ -1,0 +1,49 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Test template: create an SQS queue for CodeBuild/ChangeSet pipeline validation."
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: "Logical project/app name used in tags."
+  Environment:
+    Type: String
+    AllowedValues:
+      - product
+      - staging
+      - staging2
+    Description: "Environment label used in tags."
+  QueueName:
+    Type: String
+    Default: ""
+    Description: "Optional. If empty, CloudFormation will auto-generate a queue name."
+  MessageRetentionSeconds:
+    Type: Number
+    Default: 345600
+    MinValue: 60
+    MaxValue: 1209600
+    Description: "SQS message retention seconds (default: 4 days)."
+
+Conditions:
+  HasQueueName: !Not [!Equals [!Ref QueueName, ""]]
+
+Resources:
+  TestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !If [HasQueueName, !Ref QueueName, !Ref "AWS::NoValue"]
+      MessageRetentionPeriod: !Ref MessageRetentionSeconds
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: "CloudFormation"
+
+Outputs:
+  QueueUrl:
+    Description: "URL of the created SQS queue"
+    Value: !Ref TestQueue
+  QueueArn:
+    Description: "ARN of the created SQS queue"
+    Value: !GetAtt TestQueue.Arn
