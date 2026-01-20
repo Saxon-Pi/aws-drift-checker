@@ -125,23 +125,38 @@ Resources:
           phases:
             install:
               commands:
-                - yum -y install jq git
+                - |
+                  set -euo pipefail
+                  if command -v yum >/dev/null 2>&1; then
+                    yum -y install jq git
+                  elif command -v dnf >/dev/null 2>&1; then
+                    dnf -y install jq git
+                  elif command -v apt-get >/dev/null 2>&1; then
+                    apt-get update -y
+                    apt-get install -y jq git
+                  else
+                    echo "ERROR: No supported package manager found (yum/dnf/apt-get)."
+                    exit 1
+                  fi
                 - aws --version
-                - jq --version
-                - git --version
+                - jq --version || true
+                - git --version || true
 
             pre_build:
               commands:
-                - echo "GIT_REF=$GIT_REF"
-                - echo "TEMPLATE_PATH=$TEMPLATE_PATH"
-                - echo "PARAM_JSON=$PARAM_JSON"
-                - echo "STACK_NAME=$STACK_NAME"
                 - |
+                  set -euo pipefail
+
+                  echo "GIT_REF=${GIT_REF:-}"
+                  echo "TEMPLATE_PATH=${TEMPLATE_PATH:-}"
+                  echo "PARAM_JSON=${PARAM_JSON:-}"
+                  echo "STACK_NAME=${STACK_NAME:-}"
+
                   missing=""
-                  [ -z "$GIT_REF" ] && missing="$missing GIT_REF"
-                  [ -z "$TEMPLATE_PATH" ] && missing="$missing TEMPLATE_PATH"
-                  [ -z "$PARAM_JSON" ] && missing="$missing PARAM_JSON"
-                  [ -z "$STACK_NAME" ] && missing="$missing STACK_NAME"
+                  [ -z "${GIT_REF:-}" ] && missing="$missing GIT_REF"
+                  [ -z "${TEMPLATE_PATH:-}" ] && missing="$missing TEMPLATE_PATH"
+                  [ -z "${PARAM_JSON:-}" ] && missing="$missing PARAM_JSON"
+                  [ -z "${STACK_NAME:-}" ] && missing="$missing STACK_NAME"
                   if [ -n "$missing" ]; then
                     echo "ERROR: Missing required variables:$missing"
                     echo "Example:"
@@ -152,49 +167,43 @@ Resources:
                     exit 1
                   fi
 
-                # ---- Configure SSH deploy key ----
-                - mkdir -p ~/.ssh
-                - aws ssm get-parameter --name "$DEPLOY_KEY_SSM_PARAM" --with-decryption --query 'Parameter.Value' --output text > ~/.ssh/id_rsa
-                - chmod 600 ~/.ssh/id_rsa
-                - ssh-keyscan -t rsa github.com >> ~/.ssh/known_hosts
-                - eval "$(ssh-agent -s)"
-                - ssh-add ~/.ssh/id_rsa
+                  # ---- Configure SSH deploy key ----
+                  mkdir -p ~/.ssh
+                  aws ssm get-parameter --name "$DEPLOY_KEY_SSM_PARAM" --with-decryption --query 'Parameter.Value' --output text > ~/.ssh/id_rsa
+                  chmod 600 ~/.ssh/id_rsa
+                  ssh-keyscan -t rsa github.com >> ~/.ssh/known_hosts
+                  eval "$(ssh-agent -s)"
+                  ssh-add ~/.ssh/id_rsa
 
-                # ---- Clone repo ----
-                - rm -rf repo
-                - git clone --depth 1 --branch "$GIT_REF" "$GIT_SSH_REPO" repo
-                - cd repo
+                  # ---- Clone repo ----
+                  rm -rf repo
+                  git clone --depth 1 --branch "$GIT_REF" "$GIT_SSH_REPO" repo
+                  cd repo
 
-                # ---- Resolve template + params (same directory) ----
-                - TEMPLATE_FILE="$TEMPLATE_PATH"
-                - |
-                  # Normalize: allow TEMPLATE_PATH either with or without leading "./"
-                  TEMPLATE_FILE="${TEMPLATE_FILE#./}"
-
-                - |
+                  # ---- Resolve template + params (same directory) ----
+                  TEMPLATE_FILE="${TEMPLATE_PATH#./}"
                   [ -f "$TEMPLATE_FILE" ] || (echo "ERROR: template not found: $TEMPLATE_FILE" && exit 1)
 
-                - TEMPLATE_DIR="$(dirname "$TEMPLATE_FILE")"
-                - PARAM_FILE="$TEMPLATE_DIR/$PARAM_JSON"
-                - |
+                  TEMPLATE_DIR="$(dirname "$TEMPLATE_FILE")"
+                  PARAM_FILE="$TEMPLATE_DIR/$PARAM_JSON"
                   [ -f "$PARAM_FILE" ] || (echo "ERROR: params json not found: $PARAM_FILE" && exit 1)
 
-                - CHANGESET_NAME="${STACK_NAME}-cs-$(date +%Y%m%d%H%M%S)"
-                - echo "CHANGESET_NAME=$CHANGESET_NAME"
-                - echo "TEMPLATE_FILE=$TEMPLATE_FILE"
-                - echo "PARAM_FILE=$PARAM_FILE"
+                  CHANGESET_NAME="${STACK_NAME}-cs-$(date +%Y%m%d%H%M%S)"
+                  echo "CHANGESET_NAME=$CHANGESET_NAME"
+                  echo "TEMPLATE_FILE=$TEMPLATE_FILE"
+                  echo "PARAM_FILE=$PARAM_FILE"
 
-                # ---- Convert params.json (object) to CFN parameters array ----
-                # Expected params.json format: { "ParamA": "value", "ParamB": "value2" }
-                - jq -c 'to_entries|map({ParameterKey:.key,ParameterValue:(.value|tostring)})' "$PARAM_FILE" > /tmp/params.cfn.json
-                - cat /tmp/params.cfn.json
+                  # ---- Convert params.json (object) to CFN parameters array ----
+                  jq -c 'to_entries|map({ParameterKey:.key,ParameterValue:(.value|tostring)})' "$PARAM_FILE" > /tmp/params.cfn.json
+                  cat /tmp/params.cfn.json
 
             build:
               commands:
                 - aws cloudformation validate-template --template-body "file://$TEMPLATE_FILE"
-
-                # Determine CREATE or UPDATE
                 - |
+                  set -euo pipefail
+
+                  # Determine CREATE or UPDATE
                   if aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1; then
                     CHANGESET_TYPE="UPDATE"
                   else
@@ -202,8 +211,7 @@ Resources:
                   fi
                   echo "CHANGESET_TYPE=$CHANGESET_TYPE"
 
-                # Create Change Set (NO execute)
-                - |
+                  # Create Change Set (NO execute)
                   aws cloudformation create-change-set \
                     --stack-name "$STACK_NAME" \
                     --template-body "file://$TEMPLATE_FILE" \
@@ -212,14 +220,12 @@ Resources:
                     --parameters "file:///tmp/params.cfn.json" \
                     --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
 
-                # Wait until change set is created (so describe is stable)
-                - aws cloudformation wait change-set-create-complete --stack-name "$STACK_NAME" --change-set-name "$CHANGESET_NAME"
+                  aws cloudformation wait change-set-create-complete --stack-name "$STACK_NAME" --change-set-name "$CHANGESET_NAME"
+                  aws cloudformation describe-change-set --stack-name "$STACK_NAME" --change-set-name "$CHANGESET_NAME"
 
-                - aws cloudformation describe-change-set --stack-name "$STACK_NAME" --change-set-name "$CHANGESET_NAME"
-
-                - echo "DONE: Change Set created (not executed)."
-                - echo "To execute manually (if needed):"
-                - echo "aws cloudformation execute-change-set --stack-name $STACK_NAME --change-set-name $CHANGESET_NAME"
+                  echo "DONE: Change Set created (not executed)."
+                  echo "To execute manually (if needed):"
+                  echo "aws cloudformation execute-change-set --stack-name $STACK_NAME --change-set-name $CHANGESET_NAME"
 
 Outputs:
   CodeBuildProjectName:
