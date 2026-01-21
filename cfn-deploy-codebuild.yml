@@ -1,11 +1,11 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   CodeBuild-only deployer that clones a GitHub repo via Deploy Key (SSH),
+  resolves StackName and params.json filename based on template Metadata.StackName presence,
   and creates a CloudFormation Change Set (no execute).
-  Git ref and template base path are set at stack creation time.
 
 Parameters:
-  ProjectName:
+  BuildProjectName:
     Type: String
     Default: cfn-changeset-deployer
     Description: CodeBuild project name.
@@ -27,20 +27,30 @@ Parameters:
     Type: String
     Default: shuppa-infrastracture/cfn/templates
     Description: >
-      Base path inside the repo. At build start, provide TEMPLATE_PATH relative to this base.
-      Example: TEMPLATE_PATH=account/stg/sqs/sqs.yaml
+      Base path inside the repo. At build start, provide TEMPLATE relative to this base
+      OR provide a file name and it will be searched under this base.
+
+  ProjectName:
+    Type: String
+    Default: mobile-sales
+    Description: Project name used for naming and resolving !Sub ${ProjectName}-xxx.
+
+  EnvironmentName:
+    Type: String
+    Default: dev
+    Description: Environment name used when template has no Metadata.StackName.
 
 Resources:
   CodeBuildLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub /aws/codebuild/${ProjectName}
+      LogGroupName: !Sub /aws/codebuild/${BuildProjectName}
       RetentionInDays: 30
 
   CodeBuildServiceRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub ${ProjectName}-role
+      RoleName: !Sub ${BuildProjectName}-role
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -49,7 +59,7 @@ Resources:
               Service: codebuild.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: !Sub ${ProjectName}-policy
+        - PolicyName: !Sub ${BuildProjectName}-policy
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -57,7 +67,7 @@ Resources:
                 Action:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}:*
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${BuildProjectName}:*
 
               - Effect: Allow
                 Action:
@@ -81,7 +91,7 @@ Resources:
   CodeBuildProject:
     Type: AWS::CodeBuild::Project
     Properties:
-      Name: !Ref ProjectName
+      Name: !Ref BuildProjectName
       ServiceRole: !GetAtt CodeBuildServiceRole.Arn
       Artifacts:
         Type: NO_ARTIFACTS
@@ -95,33 +105,27 @@ Resources:
           - Name: AWS_DEFAULT_REGION
             Type: PLAINTEXT
             Value: !Ref AWS::Region
-
           - Name: DEPLOY_KEY_SSM_PARAM
             Type: PLAINTEXT
             Value: !Ref DeployKeySsmParamName
-
           - Name: GIT_SSH_REPO
             Type: PLAINTEXT
             Value: !Ref GithubSshRepo
-
-          # Fixed per project (env)
           - Name: DEFAULT_GIT_REF
             Type: PLAINTEXT
             Value: !Ref DefaultGitRef
-
-          # Fixed base path in repo
           - Name: TEMPLATE_BASE_PATH
             Type: PLAINTEXT
             Value: !Ref TemplateBasePath
+          - Name: PROJECT_NAME
+            Type: PLAINTEXT
+            Value: !Ref ProjectName
+          - Name: ENV
+            Type: PLAINTEXT
+            Value: !Ref EnvironmentName
 
           # Required at build start:
-          - Name: TEMPLATE_PATH
-            Type: PLAINTEXT
-            Value: ""
-          - Name: PARAM_JSON
-            Type: PLAINTEXT
-            Value: ""
-          - Name: STACK_NAME
+          - Name: TEMPLATE
             Type: PLAINTEXT
             Value: ""
 
@@ -156,94 +160,169 @@ Resources:
                   git --version
                   jq --version
                   aws --version || true
+                  bash --version | head -n 1 || true
 
             pre_build:
               commands:
                 - |
-                  set -eu
+                  bash -lc '
+                    set -euo pipefail
 
-                  echo "DEFAULT_GIT_REF=$DEFAULT_GIT_REF"
-                  echo "TEMPLATE_BASE_PATH=$TEMPLATE_BASE_PATH"
-                  echo "TEMPLATE_PATH=${TEMPLATE_PATH:-}"
-                  echo "PARAM_JSON=${PARAM_JSON:-}"
-                  echo "STACK_NAME=${STACK_NAME:-}"
+                    : "${TEMPLATE:?TEMPLATE is required}"
+                    : "${TEMPLATE_BASE_PATH:?TEMPLATE_BASE_PATH is required}"
+                    : "${PROJECT_NAME:?PROJECT_NAME is required}"
+                    : "${ENV:?ENV is required}"
+                    : "${DEFAULT_GIT_REF:?DEFAULT_GIT_REF is required}"
 
-                  missing=""
-                  [ -z "${TEMPLATE_PATH:-}" ] && missing="$missing TEMPLATE_PATH"
-                  [ -z "${PARAM_JSON:-}" ] && missing="$missing PARAM_JSON"
-                  [ -z "${STACK_NAME:-}" ] && missing="$missing STACK_NAME"
-                  if [ -n "$missing" ]; then
-                    echo "ERROR: Missing required variables:$missing"
-                    echo "Example:"
-                    echo "  TEMPLATE_PATH=account/stg/sqs/sqs.yaml"
-                    echo "  PARAM_JSON=mobile-sales-stg-sqs.params.json"
-                    echo "  STACK_NAME=mobile-sales-stg-sqs"
-                    exit 1
-                  fi
+                    echo "DEFAULT_GIT_REF=$DEFAULT_GIT_REF"
+                    echo "TEMPLATE_BASE_PATH=$TEMPLATE_BASE_PATH"
+                    echo "PROJECT_NAME=$PROJECT_NAME"
+                    echo "ENV=$ENV"
+                    echo "TEMPLATE=$TEMPLATE"
 
-                  # normalize base path (remove trailing slash)
-                  BASE="${TEMPLATE_BASE_PATH%/}"
-                  REL="${TEMPLATE_PATH#./}"     # strip leading ./
-                  REL="${REL#/}"                # strip leading /
-                  TEMPLATE_FILE="$BASE/$REL"
+                    # ---- Configure SSH deploy key ----
+                    mkdir -p ~/.ssh
+                    aws ssm get-parameter --name "$DEPLOY_KEY_SSM_PARAM" --with-decryption --query "Parameter.Value" --output text > ~/.ssh/id_rsa
+                    chmod 600 ~/.ssh/id_rsa
+                    ssh-keyscan -t rsa github.com >> ~/.ssh/known_hosts
+                    eval "$(ssh-agent -s)"
+                    ssh-add ~/.ssh/id_rsa
 
-                  # ---- Configure SSH deploy key ----
-                  mkdir -p ~/.ssh
-                  aws ssm get-parameter --name "$DEPLOY_KEY_SSM_PARAM" --with-decryption --query 'Parameter.Value' --output text > ~/.ssh/id_rsa
-                  chmod 600 ~/.ssh/id_rsa
-                  ssh-keyscan -t rsa github.com >> ~/.ssh/known_hosts
-                  eval "$(ssh-agent -s)"
-                  ssh-add ~/.ssh/id_rsa
+                    # ---- Clone repo (fixed ref per project) ----
+                    rm -rf repo
+                    git clone --depth 1 --branch "$DEFAULT_GIT_REF" "$GIT_SSH_REPO" repo
+                    cd repo
 
-                  # ---- Clone repo (fixed ref per project) ----
-                  rm -rf repo
-                  git clone --depth 1 --branch "$DEFAULT_GIT_REF" "$GIT_SSH_REPO" repo
-                  cd repo
+                    BASE_DIR="./${TEMPLATE_BASE_PATH#./}"
+                    BASE_DIR="${BASE_DIR%/}"
+                    TEMPLATE_INPUT="$TEMPLATE"
 
-                  # ---- Resolve template + params ----
-                  [ -f "$TEMPLATE_FILE" ] || (echo "ERROR: template not found: $TEMPLATE_FILE" && exit 1)
+                    # ---- Resolve template file (path or find) ----
+                    if [[ "$TEMPLATE_INPUT" == *"/"* ]]; then
+                      REL="${TEMPLATE_INPUT#./}"
+                      REL="${REL#/}"
+                      TEMPLATE_FILE="$BASE_DIR/$REL"
+                      [[ -f "$TEMPLATE_FILE" ]] || { echo "Template not found: $TEMPLATE_FILE"; exit 1; }
+                    else
+                      MATCHED_FILES="$(find "$BASE_DIR" -type f -name "$TEMPLATE_INPUT" -print)"
+                      [[ -n "$MATCHED_FILES" ]] || { echo "Template not found: $TEMPLATE_INPUT"; exit 1; }
+                      COUNT="$(printf "%s\n" "$MATCHED_FILES" | wc -l | tr -d " ")"
+                      [[ "$COUNT" -le 1 ]] || { echo "Multiple templates found:"; echo "$MATCHED_FILES"; exit 1; }
+                      TEMPLATE_FILE="$MATCHED_FILES"
+                    fi
 
-                  TEMPLATE_DIR="$(dirname "$TEMPLATE_FILE")"
-                  PARAM_FILE="$TEMPLATE_DIR/$PARAM_JSON"
-                  [ -f "$PARAM_FILE" ] || (echo "ERROR: params json not found: $PARAM_FILE" && exit 1)
+                    echo "TEMPLATE_FILE=$TEMPLATE_FILE"
+                    TEMPLATE_DIR="$(dirname "$TEMPLATE_FILE")"
+                    YAML_BASENAME="$(basename "$TEMPLATE_FILE")"
+                    YAML_NAME="${YAML_BASENAME%.*}"   # alb.yaml -> alb
 
-                  CHANGESET_NAME="${STACK_NAME}-cs-$(date +%Y%m%d%H%M%S)"
-                  echo "CHANGESET_NAME=$CHANGESET_NAME"
-                  echo "TEMPLATE_FILE=$TEMPLATE_FILE"
-                  echo "PARAM_FILE=$PARAM_FILE"
+                    # ---- Read Metadata.StackName (1-line) if present ----
+                    STACK_EXPR="$(python3 - <<PY
+import re, sys
+p=sys.argv[1]
+lines=open(p,"r",encoding="utf-8").read().splitlines()
+in_meta=False
+meta_indent=None
+expr=""
+for raw in lines:
+  line=raw.rstrip()
+  if not line.strip() or line.lstrip().startswith("#"):
+    continue
+  if re.match(r"^\\s*Metadata\\s*:\\s*$", line):
+    in_meta=True
+    meta_indent=len(line)-len(line.lstrip(" "))
+    continue
+  if in_meta:
+    indent=len(line)-len(line.lstrip(" "))
+    if meta_indent is not None and indent <= meta_indent:
+      in_meta=False
+      continue
+    m=re.match(r"^\\s*StackName\\s*:\\s*(.+?)\\s*$", line)
+    if m:
+      expr=m.group(1).strip()
+      break
+print(expr, end="")
+PY
+"$TEMPLATE_FILE")"
 
-                  jq -c 'to_entries|map({ParameterKey:.key,ParameterValue:(.value|tostring)})' "$PARAM_FILE" > /tmp/params.cfn.json
-                  cat /tmp/params.cfn.json
+                    if [[ -n "$STACK_EXPR" ]]; then
+                      # Case ①: Metadata.StackName exists -> use it (resolve !Sub with ${ProjectName})
+                      if [[ "$STACK_EXPR" == \!Sub* ]]; then
+                        STACK_EXPR="${STACK_EXPR#\!Sub}"
+                        STACK_EXPR="${STACK_EXPR# }"
+                      fi
+                      # strip surrounding quotes
+                      STACK_EXPR="${STACK_EXPR%\"}"; STACK_EXPR="${STACK_EXPR#\"}"
+                      STACK_EXPR="${STACK_EXPR%\'}"; STACK_EXPR="${STACK_EXPR#\'}"
+
+                      STACK_NAME="${STACK_EXPR//\$\{ProjectName\}/$PROJECT_NAME}"
+
+                      if [[ "$STACK_NAME" == *"\${"* ]]; then
+                        echo "ERROR: Unresolved variables in StackName expression:"
+                        echo "  expr=$STACK_EXPR"
+                        echo "  resolved=$STACK_NAME"
+                        exit 1
+                      fi
+
+                      PARAMS_FILE="$TEMPLATE_DIR/$STACK_NAME.params.json"
+                      echo "[Case①] STACK_NAME=$STACK_NAME"
+                      echo "[Case①] PARAMS_FILE=$PARAMS_FILE"
+                    else
+                      # Case ②: No Metadata.StackName -> generate
+                      STACK_NAME="${PROJECT_NAME}-${ENV}-${YAML_NAME}"
+                      PARAMS_FILE="$TEMPLATE_DIR/${PROJECT_NAME}-${ENV}-${YAML_NAME}.params.json"
+                      echo "[Case②] STACK_NAME=$STACK_NAME"
+                      echo "[Case②] PARAMS_FILE=$PARAMS_FILE"
+                    fi
+
+                    [[ -f "$PARAMS_FILE" ]] || { echo "Parameters file not found: $PARAMS_FILE"; exit 1; }
+
+                    CHANGESET_NAME="${STACK_NAME}-cs-$(date +%Y%m%d%H%M%S)"
+                    echo "CHANGESET_NAME=$CHANGESET_NAME"
+
+                    {
+                      echo "export TEMPLATE_FILE=\"$TEMPLATE_FILE\""
+                      echo "export STACK_NAME=\"$STACK_NAME\""
+                      echo "export PARAMS_FILE=\"$PARAMS_FILE\""
+                      echo "export CHANGESET_NAME=\"$CHANGESET_NAME\""
+                    } > /tmp/cfn_vars.sh
+                  '
 
             build:
               commands:
-                - aws cloudformation validate-template --template-body "file://$TEMPLATE_FILE"
                 - |
-                  set -eu
+                  bash -lc '
+                    set -euo pipefail
+                    . /tmp/cfn_vars.sh
 
-                  if aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1; then
-                    CHANGESET_TYPE="UPDATE"
-                  else
-                    CHANGESET_TYPE="CREATE"
-                  fi
-                  echo "CHANGESET_TYPE=$CHANGESET_TYPE"
+                    aws cloudformation validate-template --template-body "file://$TEMPLATE_FILE"
 
-                  aws cloudformation create-change-set \
-                    --stack-name "$STACK_NAME" \
-                    --template-body "file://$TEMPLATE_FILE" \
-                    --change-set-name "$CHANGESET_NAME" \
-                    --change-set-type "$CHANGESET_TYPE" \
-                    --parameters "file:///tmp/params.cfn.json" \
-                    --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
+                    if aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1; then
+                      CHANGESET_TYPE="UPDATE"
+                    else
+                      CHANGESET_TYPE="CREATE"
+                    fi
+                    echo "CHANGESET_TYPE=$CHANGESET_TYPE"
 
-                  aws cloudformation wait change-set-create-complete --stack-name "$STACK_NAME" --change-set-name "$CHANGESET_NAME"
-                  aws cloudformation describe-change-set --stack-name "$STACK_NAME" --change-set-name "$CHANGESET_NAME"
+                    # params.json is expected to be CloudFormation CLI format:
+                    # [ { "ParameterKey": "...", "ParameterValue": "..." }, ... ]
+                    aws cloudformation create-change-set \
+                      --stack-name "$STACK_NAME" \
+                      --template-body "file://$TEMPLATE_FILE" \
+                      --change-set-name "$CHANGESET_NAME" \
+                      --change-set-type "$CHANGESET_TYPE" \
+                      --parameters "file://$PARAMS_FILE" \
+                      --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
 
-                  echo "DONE: Change Set created (not executed)."
+                    aws cloudformation wait change-set-create-complete --stack-name "$STACK_NAME" --change-set-name "$CHANGESET_NAME"
+                    aws cloudformation describe-change-set --stack-name "$STACK_NAME" --change-set-name "$CHANGESET_NAME"
+
+                    echo "DONE: Change Set created (not executed)."
+                  '
 
 Outputs:
   CodeBuildProjectName:
-    Value: !Ref ProjectName
+    Value: !Ref BuildProjectName
   CodeBuildRoleArn:
     Value: !GetAtt CodeBuildServiceRole.Arn
   LogGroupName:
