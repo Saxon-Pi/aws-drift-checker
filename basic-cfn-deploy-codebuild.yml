@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   CodeBuild-only deployer that clones a GitHub repo via Deploy Key (SSH),
   and creates a CloudFormation Change Set (no execute).
-  Git ref and template base path are set at stack creation time.
+  Template path, params json filename, git ref, and stack name are required at build start.
 
 Parameters:
   ProjectName:
@@ -18,17 +18,6 @@ Parameters:
     Type: String
     Default: /cfn-deployer/github/deploykey
     Description: SSM SecureString parameter name that stores the private deploy key.
-
-  DefaultGitRef:
-    Type: String
-    Description: Git ref fixed for this build project (e.g., develop, main).
-
-  TemplateBasePath:
-    Type: String
-    Default: shuppa-infrastracture/cfn/templates
-    Description: >
-      Base path inside the repo. At build start, provide TEMPLATE_PATH relative to this base.
-      Example: TEMPLATE_PATH=account/stg/sqs/sqs.yaml
 
 Resources:
   CodeBuildLogGroup:
@@ -53,22 +42,26 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # --- CloudWatch Logs ---
               - Effect: Allow
                 Action:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}:*
 
+              # --- Read deploy key from SSM SecureString ---
               - Effect: Allow
                 Action:
                   - ssm:GetParameter
                 Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DeployKeySsmParamName}
 
+              # SecureString decryption (if using CMK, scope this to that key ARN)
               - Effect: Allow
                 Action:
                   - kms:Decrypt
                 Resource: "*"
 
+              # --- CloudFormation (Change Set create + inspection only) ---
               - Effect: Allow
                 Action:
                   - cloudformation:ValidateTemplate
@@ -104,17 +97,10 @@ Resources:
             Type: PLAINTEXT
             Value: !Ref GithubSshRepo
 
-          # Fixed per project (env)
-          - Name: DEFAULT_GIT_REF
-            Type: PLAINTEXT
-            Value: !Ref DefaultGitRef
-
-          # Fixed base path in repo
-          - Name: TEMPLATE_BASE_PATH
-            Type: PLAINTEXT
-            Value: !Ref TemplateBasePath
-
           # Required at build start:
+          - Name: GIT_REF
+            Type: PLAINTEXT
+            Value: ""
           - Name: TEMPLATE_PATH
             Type: PLAINTEXT
             Value: ""
@@ -140,7 +126,14 @@ Resources:
             install:
               commands:
                 - |
+                  echo "SHELL=$SHELL"
+                  ls -l /bin/sh || true
+                  /bin/sh --version || true
+                  command -v bash || true
+                  cat /etc/os-release || true
+
                   set -eu
+
                   if command -v yum >/dev/null 2>&1; then
                     yum -y install jq git
                   elif command -v dnf >/dev/null 2>&1; then
@@ -153,39 +146,36 @@ Resources:
                     echo "ERROR: No supported package manager found (yum/dnf/apt-get)."
                     exit 1
                   fi
+
+                  # sanity check
+                  aws --version || true
                   git --version
                   jq --version
-                  aws --version || true
 
             pre_build:
               commands:
                 - |
                   set -eu
 
-                  echo "DEFAULT_GIT_REF=$DEFAULT_GIT_REF"
-                  echo "TEMPLATE_BASE_PATH=$TEMPLATE_BASE_PATH"
+                  echo "GIT_REF=${GIT_REF:-}"
                   echo "TEMPLATE_PATH=${TEMPLATE_PATH:-}"
                   echo "PARAM_JSON=${PARAM_JSON:-}"
                   echo "STACK_NAME=${STACK_NAME:-}"
 
                   missing=""
+                  [ -z "${GIT_REF:-}" ] && missing="$missing GIT_REF"
                   [ -z "${TEMPLATE_PATH:-}" ] && missing="$missing TEMPLATE_PATH"
                   [ -z "${PARAM_JSON:-}" ] && missing="$missing PARAM_JSON"
                   [ -z "${STACK_NAME:-}" ] && missing="$missing STACK_NAME"
                   if [ -n "$missing" ]; then
                     echo "ERROR: Missing required variables:$missing"
                     echo "Example:"
-                    echo "  TEMPLATE_PATH=account/stg/sqs/sqs.yaml"
-                    echo "  PARAM_JSON=mobile-sales-stg-sqs.params.json"
-                    echo "  STACK_NAME=mobile-sales-stg-sqs"
+                    echo "  GIT_REF=main"
+                    echo "  TEMPLATE_PATH=cfn/templates/all/alb-alarm/alb-alarm.yaml"
+                    echo "  PARAM_JSON=mobile-sales-product-alb-alarm.params.json"
+                    echo "  STACK_NAME=mobile-sales-product-alb-alarm"
                     exit 1
                   fi
-
-                  # normalize base path (remove trailing slash)
-                  BASE="${TEMPLATE_BASE_PATH%/}"
-                  REL="${TEMPLATE_PATH#./}"     # strip leading ./
-                  REL="${REL#/}"                # strip leading /
-                  TEMPLATE_FILE="$BASE/$REL"
 
                   # ---- Configure SSH deploy key ----
                   mkdir -p ~/.ssh
@@ -195,12 +185,13 @@ Resources:
                   eval "$(ssh-agent -s)"
                   ssh-add ~/.ssh/id_rsa
 
-                  # ---- Clone repo (fixed ref per project) ----
+                  # ---- Clone repo ----
                   rm -rf repo
-                  git clone --depth 1 --branch "$DEFAULT_GIT_REF" "$GIT_SSH_REPO" repo
+                  git clone --depth 1 --branch "$GIT_REF" "$GIT_SSH_REPO" repo
                   cd repo
 
-                  # ---- Resolve template + params ----
+                  # ---- Resolve template + params (same directory) ----
+                  TEMPLATE_FILE="${TEMPLATE_PATH#./}"
                   [ -f "$TEMPLATE_FILE" ] || (echo "ERROR: template not found: $TEMPLATE_FILE" && exit 1)
 
                   TEMPLATE_DIR="$(dirname "$TEMPLATE_FILE")"
@@ -212,6 +203,7 @@ Resources:
                   echo "TEMPLATE_FILE=$TEMPLATE_FILE"
                   echo "PARAM_FILE=$PARAM_FILE"
 
+                  # ---- Convert params.json (object) to CFN parameters array ----
                   jq -c 'to_entries|map({ParameterKey:.key,ParameterValue:(.value|tostring)})' "$PARAM_FILE" > /tmp/params.cfn.json
                   cat /tmp/params.cfn.json
 
@@ -221,6 +213,7 @@ Resources:
                 - |
                   set -eu
 
+                  # Determine CREATE or UPDATE
                   if aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1; then
                     CHANGESET_TYPE="UPDATE"
                   else
@@ -228,6 +221,7 @@ Resources:
                   fi
                   echo "CHANGESET_TYPE=$CHANGESET_TYPE"
 
+                  # Create Change Set (NO execute)
                   aws cloudformation create-change-set \
                     --stack-name "$STACK_NAME" \
                     --template-body "file://$TEMPLATE_FILE" \
@@ -240,6 +234,8 @@ Resources:
                   aws cloudformation describe-change-set --stack-name "$STACK_NAME" --change-set-name "$CHANGESET_NAME"
 
                   echo "DONE: Change Set created (not executed)."
+                  echo "To execute manually (if needed):"
+                  echo "aws cloudformation execute-change-set --stack-name $STACK_NAME --change-set-name $CHANGESET_NAME"
 
 Outputs:
   CodeBuildProjectName:
