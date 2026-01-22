@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   CodeBuild-only deployer that clones a GitHub repo via Deploy Key (SSH),
-  resolves StackName and params.json filename based on template Metadata.StackName presence,
+  resolves StackName/params filename based on template Metadata.StackName rules,
   and creates a CloudFormation Change Set (no execute).
 
 Parameters:
@@ -63,22 +63,26 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # CloudWatch Logs
               - Effect: Allow
                 Action:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${BuildProjectName}:*
 
+              # Read deploy key from SSM SecureString
               - Effect: Allow
                 Action:
                   - ssm:GetParameter
                 Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DeployKeySsmParamName}
 
+              # SecureString decryption
               - Effect: Allow
                 Action:
                   - kms:Decrypt
                 Resource: "*"
 
+              # CloudFormation (Change Set create/describe only)
               - Effect: Allow
                 Action:
                   - cloudformation:ValidateTemplate
@@ -86,6 +90,8 @@ Resources:
                   - cloudformation:DescribeChangeSet
                   - cloudformation:DescribeStacks
                   - cloudformation:ListStacks
+                  - cloudformation:ListChangeSets
+                  - cloudformation:DeleteChangeSet
                 Resource: "*"
 
   CodeBuildProject:
@@ -124,7 +130,7 @@ Resources:
             Type: PLAINTEXT
             Value: !Ref EnvironmentName
 
-          # Required at build start:
+          # Required at build start
           - Name: TEMPLATE
             Type: PLAINTEXT
             Value: ""
@@ -145,6 +151,7 @@ Resources:
               commands:
                 - |
                   set -eu
+
                   if command -v yum >/dev/null 2>&1; then
                     yum -y install jq git
                   elif command -v dnf >/dev/null 2>&1; then
@@ -157,10 +164,12 @@ Resources:
                     echo "ERROR: No supported package manager found (yum/dnf/apt-get)."
                     exit 1
                   fi
+
                   git --version
                   jq --version
                   aws --version || true
-                  bash --version | head -n 1 || true
+                  command -v bash || true
+                  command -v awk || true
 
             pre_build:
               commands:
@@ -188,7 +197,7 @@ Resources:
                     eval "$(ssh-agent -s)"
                     ssh-add ~/.ssh/id_rsa
 
-                    # ---- Clone repo (fixed ref per project) ----
+                    # ---- Clone repo ----
                     rm -rf repo
                     git clone --depth 1 --branch "$DEFAULT_GIT_REF" "$GIT_SSH_REPO" repo
                     cd repo
@@ -211,54 +220,50 @@ Resources:
                       TEMPLATE_FILE="$MATCHED_FILES"
                     fi
 
-                    echo "TEMPLATE_FILE=$TEMPLATE_FILE"
                     TEMPLATE_DIR="$(dirname "$TEMPLATE_FILE")"
                     YAML_BASENAME="$(basename "$TEMPLATE_FILE")"
-                    YAML_NAME="${YAML_BASENAME%.*}"   # alb.yaml -> alb
+                    YAML_NAME="${YAML_BASENAME%.*}"
 
-                    # ---- Read Metadata.StackName (1-line) if present ----
-                    STACK_EXPR="$(python3 - <<PY
-import re, sys
-p=sys.argv[1]
-lines=open(p,"r",encoding="utf-8").read().splitlines()
-in_meta=False
-meta_indent=None
-expr=""
-for raw in lines:
-  line=raw.rstrip()
-  if not line.strip() or line.lstrip().startswith("#"):
-    continue
-  if re.match(r"^\\s*Metadata\\s*:\\s*$", line):
-    in_meta=True
-    meta_indent=len(line)-len(line.lstrip(" "))
-    continue
-  if in_meta:
-    indent=len(line)-len(line.lstrip(" "))
-    if meta_indent is not None and indent <= meta_indent:
-      in_meta=False
-      continue
-    m=re.match(r"^\\s*StackName\\s*:\\s*(.+?)\\s*$", line)
-    if m:
-      expr=m.group(1).strip()
-      break
-print(expr, end="")
-PY
-"$TEMPLATE_FILE")"
+                    echo "TEMPLATE_FILE=$TEMPLATE_FILE"
+                    echo "TEMPLATE_DIR=$TEMPLATE_DIR"
+                    echo "YAML_NAME=$YAML_NAME"
+
+                    # ---- Read Metadata.StackName (1-line) using awk (no Python) ----
+                    # This looks for:
+                    # Metadata:
+                    #   StackName: ...
+                    STACK_EXPR="$(awk '
+                      function indent(s){ match(s,/[^ ]/); return (RSTART?RSTART-1:0) }
+                      BEGIN{inmeta=0; metaind=-1}
+                      /^[[:space:]]*Metadata:[[:space:]]*$/ { inmeta=1; metaind=indent($0); next }
+                      {
+                        if(inmeta){
+                          i=indent($0)
+                          if(i<=metaind){ inmeta=0; next }
+                          if($0 ~ /^[[:space:]]*StackName:[[:space:]]*/){
+                            sub(/^[[:space:]]*StackName:[[:space:]]*/,"",$0)
+                            print $0
+                            exit
+                          }
+                        }
+                      }
+                    ' "$TEMPLATE_FILE")"
 
                     if [[ -n "$STACK_EXPR" ]]; then
-                      # Case ①: Metadata.StackName exists -> use it (resolve !Sub with ${ProjectName})
+                      # Case ①: Metadata.StackName exists
+                      # Strip leading !Sub and surrounding quotes if any
                       if [[ "$STACK_EXPR" == \!Sub* ]]; then
                         STACK_EXPR="${STACK_EXPR#\!Sub}"
                         STACK_EXPR="${STACK_EXPR# }"
                       fi
-                      # strip surrounding quotes
                       STACK_EXPR="${STACK_EXPR%\"}"; STACK_EXPR="${STACK_EXPR#\"}"
                       STACK_EXPR="${STACK_EXPR%\'}"; STACK_EXPR="${STACK_EXPR#\'}"
 
+                      # Minimal Sub: replace ${ProjectName}
                       STACK_NAME="${STACK_EXPR//\$\{ProjectName\}/$PROJECT_NAME}"
 
                       if [[ "$STACK_NAME" == *"\${"* ]]; then
-                        echo "ERROR: Unresolved variables in StackName expression:"
+                        echo "ERROR: Unresolved variables remain in StackName:"
                         echo "  expr=$STACK_EXPR"
                         echo "  resolved=$STACK_NAME"
                         exit 1
@@ -295,6 +300,12 @@ PY
                     set -euo pipefail
                     . /tmp/cfn_vars.sh
 
+                    echo "Using:"
+                    echo "  TEMPLATE_FILE=$TEMPLATE_FILE"
+                    echo "  STACK_NAME=$STACK_NAME"
+                    echo "  PARAMS_FILE=$PARAMS_FILE"
+                    echo "  CHANGESET_NAME=$CHANGESET_NAME"
+
                     aws cloudformation validate-template --template-body "file://$TEMPLATE_FILE"
 
                     if aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1; then
@@ -304,7 +315,7 @@ PY
                     fi
                     echo "CHANGESET_TYPE=$CHANGESET_TYPE"
 
-                    # params.json is expected to be CloudFormation CLI format:
+                    # PARAMS_FILE format: CloudFormation CLI array:
                     # [ { "ParameterKey": "...", "ParameterValue": "..." }, ... ]
                     aws cloudformation create-change-set \
                       --stack-name "$STACK_NAME" \
@@ -314,8 +325,13 @@ PY
                       --parameters "file://$PARAMS_FILE" \
                       --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
 
-                    aws cloudformation wait change-set-create-complete --stack-name "$STACK_NAME" --change-set-name "$CHANGESET_NAME"
-                    aws cloudformation describe-change-set --stack-name "$STACK_NAME" --change-set-name "$CHANGESET_NAME"
+                    aws cloudformation wait change-set-create-complete \
+                      --stack-name "$STACK_NAME" \
+                      --change-set-name "$CHANGESET_NAME"
+
+                    aws cloudformation describe-change-set \
+                      --stack-name "$STACK_NAME" \
+                      --change-set-name "$CHANGESET_NAME"
 
                     echo "DONE: Change Set created (not executed)."
                   '
