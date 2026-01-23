@@ -13,6 +13,13 @@ CloudFormation の運用方針として、
 
 ---
 
+## Code
+
+- ./template-diff-checker.yml
+- scripts/collect_and_compare.py
+
+---
+
 ## システムの目的
 - GitHub Actions 以外（手動 CLI / コンソール）で  
   スタックが更新されると **GitHub と実環境で乖離が発生**

@@ -9,6 +9,13 @@ AWS Config のマネージドルール
 
 ---
 
+## Code
+
+- ./aws-config-drift-checker.yml  
+- ./drift-notification.yml  
+
+---
+
 ## 全体構成
 
 システムは **2つの CloudFormation スタック**で構成されている
