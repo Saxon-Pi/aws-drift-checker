@@ -322,7 +322,11 @@ Resources:
                 - |
                   set -eu
                   . /tmp/cfn_vars.sh
-                  echo "EFFECTIVE: TEMPLATE_FILE=$TEMPLATE_FILE STACK_NAME=$STACK_NAME CHANGESET_NAME=$CHANGESET_NAME"
+
+                  echo "EFFECTIVE:"
+                  echo "  TEMPLATE_FILE=$TEMPLATE_FILE"
+                  echo "  STACK_NAME=$STACK_NAME"
+                  echo "  CHANGESET_NAME=$CHANGESET_NAME"
 
                   aws cloudformation validate-template --template-body "file://$TEMPLATE_FILE"
 
@@ -333,16 +337,49 @@ Resources:
                   fi
                   echo "CHANGESET_TYPE=$CHANGESET_TYPE"
 
-                  aws cloudformation create-change-set --stack-name "$STACK_NAME" --template-body "file://$TEMPLATE_FILE" --change-set-name "$CHANGESET_NAME" --change-set-type "$CHANGESET_TYPE" --parameters "file:///tmp/params.cfn.json" --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
+                  aws cloudformation create-change-set \
+                    --stack-name "$STACK_NAME" \
+                    --template-body "file://$TEMPLATE_FILE" \
+                    --change-set-name "$CHANGESET_NAME" \
+                    --change-set-type "$CHANGESET_TYPE" \
+                    --parameters "file:///tmp/params.cfn.json" \
+                    --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
 
-                  if ! aws cloudformation wait change-set-create-complete --stack-name "$STACK_NAME" --change-set-name "$CHANGESET_NAME"; then
-                    echo "ChangeSet FAILED. describe-change-set:"
-                    aws cloudformation describe-change-set --stack-name "$STACK_NAME" --change-set-name "$CHANGESET_NAME" --output json || true
+                  # Wait. If it fails, check reason. "no changes" should be treated as success.
+                  if ! aws cloudformation wait change-set-create-complete \
+                    --stack-name "$STACK_NAME" \
+                    --change-set-name "$CHANGESET_NAME"
+                  then
+                    echo "ChangeSet wait FAILED. Describing change set..."
+                    aws cloudformation describe-change-set \
+                      --stack-name "$STACK_NAME" \
+                      --change-set-name "$CHANGESET_NAME" \
+                      --output json || true
+
+                    REASON="$(aws cloudformation describe-change-set \
+                      --stack-name "$STACK_NAME" \
+                      --change-set-name "$CHANGESET_NAME" \
+                      --query 'StatusReason' \
+                      --output text 2>/dev/null || true)"
+
+                    echo "StatusReason=$REASON"
+
+                    # Treat "no changes" as success
+                    echo "$REASON" | grep -Eqi "didn't contain changes|No updates are to be performed|The submitted information didn't contain changes" && {
+                      echo "No changes detected. Treating as SUCCESS."
+                      exit 0
+                    }
+
+                    echo "ChangeSet failed for a real reason. Marking build as FAILED."
                     exit 1
                   fi
 
                   echo "ChangeSet created (not executed). Summary:"
-                  aws cloudformation describe-change-set --stack-name "$STACK_NAME" --change-set-name "$CHANGESET_NAME" --query '{Status:Status,ExecutionStatus:ExecutionStatus,StatusReason:StatusReason}' --output json
+                  aws cloudformation describe-change-set \
+                    --stack-name "$STACK_NAME" \
+                    --change-set-name "$CHANGESET_NAME" \
+                    --query '{Status:Status,ExecutionStatus:ExecutionStatus,StatusReason:StatusReason}' \
+                    --output json
 
                   echo "List ChangeSets:"
                   aws cloudformation list-change-sets --stack-name "$STACK_NAME" --output table || true
