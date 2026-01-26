@@ -1,0 +1,14 @@
+[
+  {
+    "GithubPath": "cfn/template/account/cloudtrail/cloudtrail.yaml",
+    "StackName": "scg-point-cloudtrail"
+  },
+  {
+    "GithubPath": "cfn/template/all/alb/alb.yaml",
+    "StackName": "scg-point-staging-alb"
+  },
+  {
+    "GithubPath": "cfn/template/account/iam/iam.yaml",
+    "StackName": "scg-point-iam"
+  }
+]
