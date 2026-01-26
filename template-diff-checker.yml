@@ -1,5 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "Compare GitHub templates vs CloudFormation stack templates (canonical JSON) using CodeBuild only (DeployKey SSH clone + Git-managed pairs.json + Git-managed python script). No S3/Lambda."
+Description: "Compare GitHub templates vs CloudFormation stack templates (canonical JSON) using CodeBuild only.
+DeployKey is stored in SSM Parameter Store (SecureString). Pairs JSON and Python script are managed in GitHub repo. No S3/Lambda."
 
 Parameters:
   # Git (SSH Deploy Key)
@@ -10,9 +11,17 @@ Parameters:
     Type: String
     Description: "Branch name to check (free input: develop/prd/main etc.)"
 
-  DeployKeySecretArn:
+  # Deploy key in SSM Parameter Store
+  DeployKeySsmParamName:
     Type: String
-    Description: "Secrets Manager ARN containing the SSH private key (SecretString is the private key PEM)."
+    Default: "/cfn-diff-checker/github/deploykey"
+    Description: "SSM Parameter Store name (SecureString) that stores the SSH private key (PEM)."
+
+  # Optional: If your SecureString uses a customer-managed KMS key, specify its ARN (or leave empty)
+  DeployKeyKmsKeyArn:
+    Type: String
+    Default: ""
+    Description: "Optional. KMS Key ARN used to encrypt the SecureString in SSM. If empty, kms:Decrypt permission is not explicitly added."
 
   # Repo paths
   PairsJsonPath:
@@ -21,12 +30,12 @@ Parameters:
   ComparatorScriptPath:
     Type: String
     Default: "scripts/collect_and_compare_pairs.py"
-    Description: "Path in repo to python comparator script"
+    Description: "Path in repo to python comparator script (it should publish to SNS itself)"
 
   # Notification
   NotificationEmail:
     Type: String
-    Description: "SNS email subscription target (you can add more subscribers later)"
+    Description: "SNS email subscription target (you can add more subscribers later, including AWS Chatbot for Slack)"
 
   # Schedule
   ScheduleExpression:
@@ -38,6 +47,9 @@ Parameters:
     Default: "Asia/Tokyo"
     Description: "Timezone for scheduler (e.g., Asia/Tokyo)"
 
+Conditions:
+  HasKmsKeyArn: !Not [!Equals [!Ref DeployKeyKmsKeyArn, ""]]
+
 Resources:
   ###################################
   # SNS
@@ -45,7 +57,6 @@ Resources:
   DiffTopic:
     Type: AWS::SNS::Topic
     Properties:
-      # StackNameベースにして衝突を避ける
       TopicName: !Sub "${AWS::StackName}-cfn-template-diff"
       DisplayName: !Sub "CFN template diff (${AWS::StackName})"
 
@@ -83,13 +94,22 @@ Resources:
                   - logs:PutLogEvents
                 Resource: "*"
 
-              # Read deploy key secret
+              # Read DeployKey from SSM (SecureString)
               - Effect: Allow
                 Action:
-                  - secretsmanager:GetSecretValue
-                Resource: !Ref DeployKeySecretArn
+                  - ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DeployKeySsmParamName}"
 
-              # CFN template read
+              # (Optional) KMS decrypt if SecureString is encrypted with CMK
+              - !If
+                - HasKmsKeyArn
+                - Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                  Resource: !Ref DeployKeyKmsKeyArn
+                - !Ref "AWS::NoValue"
+
+              # CloudFormation template read
               - Effect: Allow
                 Action:
                   - cloudformation:GetTemplate
@@ -102,7 +122,7 @@ Resources:
                 Resource: !Ref DiffTopic
 
   ###################################
-  # CodeBuild Project (NO_SOURCE + SSH clone)
+  # CodeBuild Project (NO_SOURCE + SSH clone with DeployKey from SSM)
   ###################################
   TemplateCompareProject:
     Type: AWS::CodeBuild::Project
@@ -126,9 +146,8 @@ Resources:
             Value: !Ref ComparatorScriptPath
           - Name: SNS_TOPIC_ARN
             Value: !Ref DiffTopic
-          - Name: DEPLOY_KEY
-            Type: SECRETS_MANAGER
-            Value: !Ref DeployKeySecretArn
+          - Name: DEPLOY_KEY_SSM_PARAM
+            Value: !Ref DeployKeySsmParamName
           - Name: STACK_NAME_LABEL
             Value: !Ref AWS::StackName
       Source:
@@ -147,16 +166,16 @@ Resources:
                 - 'echo "PairsJsonPath: ${PAIRS_JSON_PATH}"'
                 - 'echo "ComparatorScriptPath: ${COMPARATOR_SCRIPT_PATH}"'
                 - 'echo "SNS: ${SNS_TOPIC_ARN}"'
-                - 'mkdir -p ~/.ssh'
-                - 'echo "${DEPLOY_KEY}" > ~/.ssh/id_rsa'
-                - 'chmod 600 ~/.ssh/id_rsa'
-                - 'ssh-keyscan github.com >> ~/.ssh/known_hosts'
-                - 'git clone --depth 1 --branch "${GIT_BRANCH}" "${GIT_REPO_SSH_URL}" repo'
-                - 'cd repo'
+                - 'echo "DeployKeySSM: ${DEPLOY_KEY_SSM_PARAM}"'
+                - mkdir -p ~/.ssh
+                - aws ssm get-parameter --name "${DEPLOY_KEY_SSM_PARAM}" --with-decryption --query "Parameter.Value" --output text > ~/.ssh/id_ed25519
+                - chmod 600 ~/.ssh/id_ed25519
+                - ssh-keyscan github.com >> ~/.ssh/known_hosts
+                - git clone --depth 1 --branch "${GIT_BRANCH}" "${GIT_REPO_SSH_URL}" repo
+                - cd repo
             build:
               commands:
                 - set -eu
-                # Pythonスクリプトが比較→SNS通知まで行う想定
                 - python3 "${COMPARATOR_SCRIPT_PATH}"
           cache:
             paths: []
@@ -203,10 +222,13 @@ Resources:
 Outputs:
   SnsTopicArn:
     Value: !Ref DiffTopic
-    Description: "SNS Topic ARN for notifications"
+    Description: "SNS Topic ARN for notifications (email/Slack(AWS Chatbot) can subscribe)"
   CodeBuildProjectName:
     Value: !Ref TemplateCompareProject
-    Description: "CodeBuild project that clones repo via DeployKey and compares GitHub templates vs CFN GetTemplate"
+    Description: "CodeBuild project that clones repo via DeployKey (SSM) and compares GitHub templates vs CFN GetTemplate"
   ScheduleName:
     Value: !Ref DailySchedule
     Description: "Scheduler schedule name"
+  DeployKeySsmParamName:
+    Value: !Ref DeployKeySsmParamName
+    Description: "SSM parameter name used for DeployKey"
