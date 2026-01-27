@@ -22,14 +22,16 @@ Parameters:
   # General Configuration
   SystemName:
     Type: String
-    Description: "System Name"
+    Description: "System name (used as resource name prefix)"
+    AllowedPattern: "^[a-z0-9-]+$"
+    ConstraintDescription: "Use lowercase letters, numbers, and hyphens only."
+
   Environment:
-    Description: "Environment Name"
     Type: String
-    AllowedValues:
-      - "prd"
-      - "stg"
-      - "dev"
+    Description: "Environment name (used only for resource naming, e.g. dev, stg, prd, sandbox)"
+    Default: dev
+    AllowedPattern: "^[a-z0-9-]+$"
+    ConstraintDescription: "Use lowercase letters, numbers, and hyphens only."
 
   # AWS Config Configuration
   MaximumExecutionFrequency:
@@ -46,12 +48,10 @@ Parameters:
   # Amazon SNS Configuration
   EmailAddress:
     Type: String
-    Description: "Email Address for receiving notification"
+    Description: "Email address for receiving drift notifications (initial subscription)"
 
 Resources:
-  ###################################
-  # AWS Config Configuration
-  ###################################
+  # IAM for AWS Config Drift Detection
   ConfigCfnDriftPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
@@ -60,12 +60,12 @@ Resources:
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
-          - Effect: "Allow"
+          - Effect: Allow
             Action:
-              - "cloudformation:DetectStackResourceDrift"
-              - "cloudformation:DescribeStackDriftDetectionStatus"
-              - "cloudformation:DetectStackDrift"
-              - "cloudformation:DescribeStackResourceDrifts"
+              - cloudformation:DetectStackResourceDrift
+              - cloudformation:DescribeStackDriftDetectionStatus
+              - cloudformation:DetectStackDrift
+              - cloudformation:DescribeStackResourceDrifts
             Resource: "*"
 
   ConfigCfnDriftRole:
@@ -76,16 +76,17 @@ Resources:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
-          - Effect: "Allow"
+          - Effect: Allow
             Principal:
               Service:
-                - "config.amazonaws.com"
+                - config.amazonaws.com
             Action:
-              - "sts:AssumeRole"
+              - sts:AssumeRole
       ManagedPolicyArns:
-        - "arn:aws:iam::aws:policy/ReadOnlyAccess"
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
         - !Ref ConfigCfnDriftPolicy
 
+  # AWS Config Rule
   ConfigCfnDriftRule:
     Type: AWS::Config::ConfigRule
     Properties:
@@ -94,15 +95,13 @@ Resources:
         cloudformationRoleArn: !GetAtt ConfigCfnDriftRole.Arn
       Scope:
         ComplianceResourceTypes:
-          - "AWS::CloudFormation::Stack"
+          - AWS::CloudFormation::Stack
       Source:
-        Owner: "AWS"
-        SourceIdentifier: "CLOUDFORMATION_STACK_DRIFT_DETECTION_CHECK"
+        Owner: AWS
+        SourceIdentifier: CLOUDFORMATION_STACK_DRIFT_DETECTION_CHECK
       MaximumExecutionFrequency: !Ref MaximumExecutionFrequency
 
-  ###################################
-  # Amazon SNS Configuration
-  ###################################
+  # Amazon SNS
   SnsCfnDriftTopic:
     Type: AWS::SNS::Topic
     Properties:
@@ -114,7 +113,7 @@ Resources:
     Properties:
       Endpoint: !Ref EmailAddress
       TopicArn: !Ref SnsCfnDriftTopic
-      Protocol: "email"
+      Protocol: email
 
   SnsCfnDriftTopicPolicy:
     Type: AWS::SNS::TopicPolicy
@@ -123,51 +122,35 @@ Resources:
         - !Ref SnsCfnDriftTopic
       PolicyDocument:
         Statement:
-          - Effect: "Allow"
+          - Effect: Allow
             Principal:
-              Service: "events.amazonaws.com"
-            Action: "sns:Publish"
+              Service: events.amazonaws.com
+            Action: sns:Publish
             Resource: !Ref SnsCfnDriftTopic
 
-  ###################################
-  # Amazon EventBridge Configuration
-  ###################################
+  # EventBridge
   EventsCfnDriftRule:
     Type: AWS::Events::Rule
     Properties:
       Name: !Sub "${SystemName}-${Environment}-cfn-drift-event-rule"
       EventPattern:
         source:
-          - "aws.config"
+          - aws.config
         detail-type:
-          - "Config Rules Compliance Change"
+          - Config Rules Compliance Change
         detail:
           messageType:
-            - "ComplianceChangeNotification"
+            - ComplianceChangeNotification
           newEvaluationResult:
             complianceType:
-              - "NON_COMPLIANT"
+              - NON_COMPLIANT
           configRuleName:
             - !Ref ConfigCfnDriftRule
       Targets:
         - Arn: !Ref SnsCfnDriftTopic
-          Id: "cfn-drift"
-          InputTransformer:
-            InputPathsMap:
-              "account": "$.detail.awsAccountId"
-              "region": "$.detail.awsRegion"
-              "resourceId": "$.detail.resourceId"
-              "time": "$.detail.newEvaluationResult.resultRecordedTime"
-            InputTemplate: |
-              "CloudFormation Stack のドリフトを検出しました。"
-              "Account ID : <account>"
-              "Region : <region>"
-              "ResourceId : <resourceId>"
-              "Time : <time>"
-  
-###################################
+          Id: cfn-drift
+
 # Outputs
-###################################
 Outputs:
   ConfigRuleName:
     Description: "AWS Config managed rule name for drift detection"
