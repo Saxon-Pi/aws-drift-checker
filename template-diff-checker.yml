@@ -1,40 +1,41 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "Compare GitHub CFN templates vs CloudFormation stack templates using canonical JSON normalization (CodeBuild+S3+Lambda+SNS+Scheduler)"
+Description: "Compare GitHub templates vs CloudFormation stack templates (canonical JSON) using CodeBuild only.
+DeployKey is stored in SSM Parameter Store (SecureString). Pairs JSON and Python script are managed in GitHub repo. No S3/Lambda."
 
 Parameters:
-  # GitHub
-  GitHubOwner:
+  # Git (SSH Deploy Key)
+  GitRepoSshUrl:
     Type: String
-    Description: "GitHub owner/org (e.g., egstock)"
-  GitHubRepo:
+    Description: "Git SSH URL (e.g., git@github.com:egstock/infra-cfn.git)"
+  GitBranch:
     Type: String
-    Description: "GitHub repo name (e.g., infra-cfn)"
-  GitHubBranch:
-    Type: String
-    Description: "Branch name (= environment) to check (e.g., dev/stg/prd)"
-  GitHubPatSecretArn:
-    Type: String
-    Description: "Secrets Manager ARN that stores GitHub PAT in SecretString JSON key: token"
+    Description: "Branch name to check (free input: develop/prd/main etc.)"
 
-  # Templates to check
-  TemplateList:
+  # Deploy key in SSM Parameter Store
+  DeployKeySsmParamName:
     Type: String
-    Description: "Comma-separated template file paths in repo (e.g., templates/a.yaml,templates/b.yaml)"
-  StackNamePrefix:
-    Type: String
-    Default: "scg-point"
-    Description: "CloudFormation stack name prefix. StackName = <prefix>-<env>-<templateBaseName>"
+    Default: "/cfn-diff-checker/github/deploykey"
+    Description: "SSM Parameter Store name (SecureString) that stores the SSH private key (PEM)."
 
-  # Storage
-  ArtifactBucketName:
+  # Optional: If your SecureString uses a customer-managed KMS key, specify its ARN (or leave empty)
+  DeployKeyKmsKeyArn:
     Type: String
     Default: ""
-    Description: "Optional. If empty, a bucket will be created."
+    Description: "Optional. KMS Key ARN used to encrypt the SecureString in SSM. If empty, kms:Decrypt permission is not explicitly added."
+
+  # Repo paths
+  PairsJsonPath:
+    Type: String
+    Description: "Path in repo to pairs JSON file (e.g., config/pairs/develop.json)"
+  ComparatorScriptPath:
+    Type: String
+    Default: "scripts/collect_and_compare_pairs.py"
+    Description: "Path in repo to python comparator script (it should publish to SNS itself)"
 
   # Notification
   NotificationEmail:
     Type: String
-    Description: "SNS email subscription target"
+    Description: "SNS email subscription target (you can add more subscribers later, including AWS Chatbot for Slack)"
 
   # Schedule
   ScheduleExpression:
@@ -47,7 +48,7 @@ Parameters:
     Description: "Timezone for scheduler (e.g., Asia/Tokyo)"
 
 Conditions:
-  CreateBucket: !Equals [!Ref ArtifactBucketName, ""]
+  HasKmsKeyArn: !Not [!Equals [!Ref DeployKeyKmsKeyArn, ""]]
 
 Resources:
   ###################################
@@ -56,8 +57,8 @@ Resources:
   DiffTopic:
     Type: AWS::SNS::Topic
     Properties:
-      TopicName: !Sub "cfn-template-diff-${GitHubRepo}-${GitHubBranch}"
-      DisplayName: !Sub "CFN template diff (${GitHubOwner}/${GitHubRepo}@${GitHubBranch})"
+      TopicName: !Sub "${AWS::StackName}-cfn-template-diff"
+      DisplayName: !Sub "CFN template diff (${AWS::StackName})"
 
   DiffSubscription:
     Type: AWS::SNS::Subscription
@@ -67,46 +68,12 @@ Resources:
       TopicArn: !Ref DiffTopic
 
   ###################################
-  # S3 Bucket (artifacts)
-  ###################################
-  ArtifactBucket:
-    Type: AWS::S3::Bucket
-    Condition: CreateBucket
-    Properties:
-      VersioningConfiguration:
-        Status: Enabled
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-
-  ArtifactBucketPolicy:
-    Type: AWS::S3::BucketPolicy
-    Condition: CreateBucket
-    Properties:
-      Bucket: !Ref ArtifactBucket
-      PolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: EnforceTLS
-            Effect: Deny
-            Principal: "*"
-            Action: "s3:*"
-            Resource:
-              - !Sub "arn:aws:s3:::${ArtifactBucket}/*"
-              - !Sub "arn:aws:s3:::${ArtifactBucket}"
-            Condition:
-              Bool:
-                aws:SecureTransport: false
-
-  ###################################
-  # CodeBuild: GitHub + CFN(GetTemplate) -> S3 (canonical JSON)
+  # CodeBuild Role
   ###################################
   CodeBuildRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "cfn-template-sync-${GitHubRepo}-${GitHubBranch}"
+      RoleName: !Sub "${AWS::StackName}-codebuild-role"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -115,7 +82,7 @@ Resources:
               Service: codebuild.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: !Sub "cfn-template-sync-policy-${GitHubRepo}-${GitHubBranch}"
+        - PolicyName: !Sub "${AWS::StackName}-codebuild-policy"
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -126,40 +93,41 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: "*"
-              # S3 write artifacts
+
+              # Read DeployKey from SSM (SecureString)
               - Effect: Allow
                 Action:
-                  - s3:PutObject
-                  - s3:PutObjectTagging
-                  - s3:AbortMultipartUpload
-                  - s3:ListBucketMultipartUploads
-                  - s3:ListBucket
-                Resource:
-                  - !If
-                    - CreateBucket
-                    - !Sub "arn:aws:s3:::${ArtifactBucket}"
-                    - !Sub "arn:aws:s3:::${ArtifactBucketName}"
-                  - !If
-                    - CreateBucket
-                    - !Sub "arn:aws:s3:::${ArtifactBucket}/*"
-                    - !Sub "arn:aws:s3:::${ArtifactBucketName}/*"
-              # CFN template read
+                  - ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DeployKeySsmParamName}"
+
+              # (Optional) KMS decrypt if SecureString is encrypted with CMK
+              - !If
+                - HasKmsKeyArn
+                - Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                  Resource: !Ref DeployKeyKmsKeyArn
+                - !Ref "AWS::NoValue"
+
+              # CloudFormation template read
               - Effect: Allow
                 Action:
                   - cloudformation:GetTemplate
                 Resource: "*"
 
-  GitHubSourceCredential:
-    Type: AWS::CodeBuild::SourceCredential
-    Properties:
-      AuthType: PERSONAL_ACCESS_TOKEN
-      ServerType: GITHUB
-      Token: !Sub "{{resolve:secretsmanager:${GitHubPatSecretArn}:SecretString:token}}"
+              # Publish notification
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref DiffTopic
 
-  TemplateSyncProject:
+  ###################################
+  # CodeBuild Project (NO_SOURCE + SSH clone with DeployKey from SSM)
+  ###################################
+  TemplateCompareProject:
     Type: AWS::CodeBuild::Project
     Properties:
-      Name: !Sub "cfn-template-sync-${GitHubRepo}-${GitHubBranch}"
+      Name: !Sub "${AWS::StackName}-cfn-template-compare-${GitBranch}"
       ServiceRole: !GetAtt CodeBuildRole.Arn
       Artifacts:
         Type: NO_ARTIFACTS
@@ -168,24 +136,22 @@ Resources:
         ComputeType: BUILD_GENERAL1_SMALL
         Image: aws/codebuild/standard:7.0
         EnvironmentVariables:
-          - Name: GITHUB_BRANCH
-            Value: !Ref GitHubBranch
-          - Name: TEMPLATE_LIST
-            Value: !Ref TemplateList
-          - Name: GITHUB_OWNER
-            Value: !Ref GitHubOwner
-          - Name: GITHUB_REPO
-            Value: !Ref GitHubRepo
-          - Name: STACK_PREFIX
-            Value: !Ref StackNamePrefix
-          - Name: S3_BUCKET
-            Value: !If [CreateBucket, !Ref ArtifactBucket, !Ref ArtifactBucketName]
-          - Name: S3_PREFIX
-            Value: !Sub "compare/${GitHubOwner}/${GitHubRepo}/${GitHubBranch}/latest/"
+          - Name: GIT_REPO_SSH_URL
+            Value: !Ref GitRepoSshUrl
+          - Name: GIT_BRANCH
+            Value: !Ref GitBranch
+          - Name: PAIRS_JSON_PATH
+            Value: !Ref PairsJsonPath
+          - Name: COMPARATOR_SCRIPT_PATH
+            Value: !Ref ComparatorScriptPath
+          - Name: SNS_TOPIC_ARN
+            Value: !Ref DiffTopic
+          - Name: DEPLOY_KEY_SSM_PARAM
+            Value: !Ref DeployKeySsmParamName
+          - Name: STACK_NAME_LABEL
+            Value: !Ref AWS::StackName
       Source:
-        Type: GITHUB
-        Location: !Sub "https://github.com/${GitHubOwner}/${GitHubRepo}.git"
-        GitCloneDepth: 1
+        Type: NO_SOURCE
         BuildSpec: |
           version: 0.2
           phases:
@@ -195,186 +161,32 @@ Resources:
                 - pip3 install --quiet cfn-flip
             pre_build:
               commands:
-                - 'echo "Repo: ${GITHUB_OWNER}/${GITHUB_REPO}"'
-                - 'echo "Branch: ${GITHUB_BRANCH}"'
-                - 'echo "Templates: ${TEMPLATE_LIST}"'
-                - 'echo "S3: s3://${S3_BUCKET}/${S3_PREFIX}"'
+                - 'echo "Repo: ${GIT_REPO_SSH_URL}"'
+                - 'echo "Branch: ${GIT_BRANCH}"'
+                - 'echo "PairsJsonPath: ${PAIRS_JSON_PATH}"'
+                - 'echo "ComparatorScriptPath: ${COMPARATOR_SCRIPT_PATH}"'
+                - 'echo "SNS: ${SNS_TOPIC_ARN}"'
+                - 'echo "DeployKeySSM: ${DEPLOY_KEY_SSM_PARAM}"'
+                - mkdir -p ~/.ssh
+                - aws ssm get-parameter --name "${DEPLOY_KEY_SSM_PARAM}" --with-decryption --query "Parameter.Value" --output text > ~/.ssh/id_ed25519
+                - chmod 600 ~/.ssh/id_ed25519
+                - ssh-keyscan github.com >> ~/.ssh/known_hosts
+                - git clone --depth 1 --branch "${GIT_BRANCH}" "${GIT_REPO_SSH_URL}" repo
+                - cd repo
             build:
               commands:
                 - set -eu
-                - git checkout "${GITHUB_BRANCH}"
-                - python3 scripts/collect_and_compare.py
+                - python3 "${COMPARATOR_SCRIPT_PATH}"
           cache:
             paths: []
 
   ###################################
-  # Lambda: Compare S3 canonical JSONs and notify SNS
-  ###################################
-  ComparatorRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "cfn-template-compare-${GitHubRepo}-${GitHubBranch}"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: !Sub "cfn-template-compare-policy-${GitHubRepo}-${GitHubBranch}"
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              # Logs
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: "*"
-              # Read from S3 artifacts
-              - Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:ListBucket
-                Resource:
-                  - !If
-                    - CreateBucket
-                    - !Sub "arn:aws:s3:::${ArtifactBucket}"
-                    - !Sub "arn:aws:s3:::${ArtifactBucketName}"
-                  - !If
-                    - CreateBucket
-                    - !Sub "arn:aws:s3:::${ArtifactBucket}/*"
-                    - !Sub "arn:aws:s3:::${ArtifactBucketName}/*"
-              # Publish notification
-              - Effect: Allow
-                Action:
-                  - sns:Publish
-                Resource: !Ref DiffTopic
-
-  TemplateComparatorFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub "cfn-template-compare-${GitHubRepo}-${GitHubBranch}"
-      Runtime: python3.12
-      Handler: index.handler
-      Role: !GetAtt ComparatorRole.Arn
-      Timeout: 60
-      MemorySize: 256
-      Environment:
-        Variables:
-          S3_BUCKET: !If [CreateBucket, !Ref ArtifactBucket, !Ref ArtifactBucketName]
-          S3_PREFIX: !Sub "compare/${GitHubOwner}/${GitHubRepo}/${GitHubBranch}/latest/"
-          GITHUB_REPO: !Sub "${GitHubOwner}/${GitHubRepo}"
-          GITHUB_BRANCH: !Ref GitHubBranch
-          TEMPLATE_LIST: !Ref TemplateList
-          SNS_TOPIC_ARN: !Ref DiffTopic
-      Code:
-        ZipFile: |
-          import os
-          import boto3
-          from botocore.exceptions import ClientError
-          from datetime import datetime, timezone
-
-          s3 = boto3.client("s3")
-          sns = boto3.client("sns")
-
-          def s3_get_text(bucket: str, key: str) -> str:
-              obj = s3.get_object(Bucket=bucket, Key=key)
-              return obj["Body"].read().decode("utf-8")
-
-          def handler(event, context):
-              bucket = os.environ["S3_BUCKET"]
-              prefix = os.environ["S3_PREFIX"]
-              repo = os.environ["GITHUB_REPO"]
-              branch = os.environ["GITHUB_BRANCH"]
-              templates = [t.strip() for t in os.environ["TEMPLATE_LIST"].split(",") if t.strip()]
-              topic = os.environ["SNS_TOPIC_ARN"]
-
-              now = datetime.now(timezone.utc).isoformat()
-              mismatches = []
-              missing = []
-
-              for tpath in templates:
-                  base = tpath.split("/")[-1]
-                  name = base.rsplit(".", 1)[0]
-                  gh_key = f"{prefix}github/{name}.json"
-                  cfn_key = f"{prefix}cfn/{name}.json"
-
-                  try:
-                      gh = s3_get_text(bucket, gh_key)
-                      cfn = s3_get_text(bucket, cfn_key)
-                  except ClientError as e:
-                      missing.append({"template": tpath, "error": str(e)})
-                      continue
-
-                  if gh != cfn:
-                      # Stack名は meta からも辿れるが、ここでは命名規則前提ならテンプレ名で十分
-                      mismatches.append({"template": tpath, "githubKey": gh_key, "cfnKey": cfn_key})
-
-              if not mismatches and not missing:
-                  print("[OK] No diffs.")
-                  return {"status": "ok", "checkedAt": now, "diffs": 0}
-
-              lines = []
-              lines.append("CloudFormation テンプレート差分検知（canonical JSON 比較）")
-              lines.append(f"CheckedAt(UTC): {now}")
-              lines.append(f"Repo: {repo}")
-              lines.append(f"Branch/Env: {branch}")
-              lines.append("")
-
-              if mismatches:
-                  lines.append(f"DIFF: {len(mismatches)}")
-                  for i, m in enumerate(mismatches, start=1):
-                      lines.append(f"{i}. template={m['template']}")
-                  lines.append("")
-
-              if missing:
-                  lines.append(f"MISSING_ARTIFACTS: {len(missing)}")
-                  for i, m in enumerate(missing, start=1):
-                      lines.append(f"{i}. template={m['template']}  err={m['error'][:200]}")
-                  lines.append("")
-
-              msg = "\n".join(lines)
-              subject = f"[CFN Template Diff] {repo} {branch} diffs={len(mismatches)}"
-
-              sns.publish(TopicArn=topic, Subject=subject, Message=msg)
-
-              return {"status": "notified", "checkedAt": now, "diffs": len(mismatches), "missing": len(missing)}
-
-  ###################################
-  # EventBridge: CodeBuild SUCCEEDED -> Lambda
-  ###################################
-  CodeBuildToLambdaRule:
-    Type: AWS::Events::Rule
-    Properties:
-      Name: !Sub "cfn-template-compare-on-build-${GitHubRepo}-${GitHubBranch}"
-      EventPattern:
-        source: ["aws.codebuild"]
-        detail-type: ["CodeBuild Build State Change"]
-        detail:
-          project-name: [!Ref TemplateSyncProject]
-          build-status: ["SUCCEEDED"]
-      Targets:
-        - Arn: !GetAtt TemplateComparatorFunction.Arn
-          Id: ComparatorLambdaTarget
-
-  AllowEventsInvokeLambda:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref TemplateComparatorFunction
-      Action: lambda:InvokeFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt CodeBuildToLambdaRule.Arn
-
-  ###################################
-  # EventBridge Scheduler: periodic StartBuild
+  # Scheduler: periodic StartBuild
   ###################################
   SchedulerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "cfn-template-check-scheduler-${GitHubRepo}-${GitHubBranch}"
+      RoleName: !Sub "${AWS::StackName}-scheduler-role"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -383,19 +195,19 @@ Resources:
               Service: scheduler.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: !Sub "cfn-template-check-scheduler-policy-${GitHubRepo}-${GitHubBranch}"
+        - PolicyName: !Sub "${AWS::StackName}-scheduler-policy"
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
                   - codebuild:StartBuild
-                Resource: !GetAtt TemplateSyncProject.Arn
+                Resource: !GetAtt TemplateCompareProject.Arn
 
   DailySchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
-      Name: !Sub "cfn-template-check-${GitHubRepo}-${GitHubBranch}"
+      Name: !Sub "${AWS::StackName}-template-check-${GitBranch}"
       State: ENABLED
       ScheduleExpression: !Ref ScheduleExpression
       ScheduleExpressionTimezone: !Ref ScheduleTimezone
@@ -405,20 +217,18 @@ Resources:
         Arn: "arn:aws:scheduler:::aws-sdk:codebuild:startBuild"
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: !Sub |
-          {
-            "ProjectName": "${TemplateSyncProject}"
-          }
+          { "ProjectName": "${TemplateCompareProject}" }
 
 Outputs:
   SnsTopicArn:
     Value: !Ref DiffTopic
-    Description: "SNS Topic ARN for notifications"
-  ArtifactBucket:
-    Value: !If [CreateBucket, !Ref ArtifactBucket, !Ref ArtifactBucketName]
-    Description: "S3 bucket for storing canonical templates"
+    Description: "SNS Topic ARN for notifications (email/Slack(AWS Chatbot) can subscribe)"
   CodeBuildProjectName:
-    Value: !Ref TemplateSyncProject
-    Description: "CodeBuild project that pulls GitHub templates + CFN templates and uploads canonical JSON to S3"
-  ComparatorLambdaName:
-    Value: !Ref TemplateComparatorFunction
-    Description: "Lambda that compares canonical JSON in S3 and notifies SNS on diffs"
+    Value: !Ref TemplateCompareProject
+    Description: "CodeBuild project that clones repo via DeployKey (SSM) and compares GitHub templates vs CFN GetTemplate"
+  ScheduleName:
+    Value: !Ref DailySchedule
+    Description: "Scheduler schedule name"
+  DeployKeySsmParamName:
+    Value: !Ref DeployKeySsmParamName
+    Description: "SSM parameter name used for DeployKey"
