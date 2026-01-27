@@ -3,6 +3,13 @@ Description: "Compare GitHub templates vs CloudFormation stack templates (canoni
 DeployKey is stored in SSM Parameter Store (SecureString). Pairs JSON and Python script are managed in GitHub repo. No S3/Lambda."
 
 Parameters:
+  # Naming
+  CodeBuildProjectName:
+    Type: String
+    Description: "CodeBuild Project Name (must be unique in this AWS account/region)"
+    AllowedPattern: "^[A-Za-z0-9][A-Za-z0-9-_]{1,254}$"
+    ConstraintDescription: "Use alphanumerics, hyphen, underscore. 2-255 chars."
+
   # Git (SSH Deploy Key)
   GitRepoSshUrl:
     Type: String
@@ -15,7 +22,7 @@ Parameters:
   DeployKeySsmParamName:
     Type: String
     Default: "/cfn-diff-checker/github/deploykey"
-    Description: "SSM Parameter Store name (SecureString) that stores the SSH private key (PEM)."
+    Description: "SSM Parameter Store name (SecureString) that stores the SSH private key (ed25519 private key)."
 
   # Optional: If your SecureString uses a customer-managed KMS key, specify its ARN (or leave empty)
   DeployKeyKmsKeyArn:
@@ -73,7 +80,7 @@ Resources:
   CodeBuildRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${AWS::StackName}-codebuild-role"
+      RoleName: !Sub "${CodeBuildProjectName}-role"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -82,7 +89,7 @@ Resources:
               Service: codebuild.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: !Sub "${AWS::StackName}-codebuild-policy"
+        - PolicyName: !Sub "${CodeBuildProjectName}-policy"
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -127,7 +134,7 @@ Resources:
   TemplateCompareProject:
     Type: AWS::CodeBuild::Project
     Properties:
-      Name: !Sub "${AWS::StackName}-cfn-template-compare-${GitBranch}"
+      Name: !Ref CodeBuildProjectName
       ServiceRole: !GetAtt CodeBuildRole.Arn
       Artifacts:
         Type: NO_ARTIFACTS
@@ -186,7 +193,7 @@ Resources:
   SchedulerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${AWS::StackName}-scheduler-role"
+      RoleName: !Sub "${CodeBuildProjectName}-scheduler-role"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -195,7 +202,7 @@ Resources:
               Service: scheduler.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: !Sub "${AWS::StackName}-scheduler-policy"
+        - PolicyName: !Sub "${CodeBuildProjectName}-scheduler-policy"
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -225,7 +232,7 @@ Outputs:
     Description: "SNS Topic ARN for notifications (email/Slack(AWS Chatbot) can subscribe)"
   CodeBuildProjectName:
     Value: !Ref TemplateCompareProject
-    Description: "CodeBuild project that clones repo via DeployKey (SSM) and compares GitHub templates vs CFN GetTemplate"
+    Description: "CodeBuild project name (customizable by parameter)"
   ScheduleName:
     Value: !Ref DailySchedule
     Description: "Scheduler schedule name"
