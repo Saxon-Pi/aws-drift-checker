@@ -1,14 +1,14 @@
 [
   {
-    "GithubPath": "cfn/template/account/cloudtrail/cloudtrail.yaml",
-    "StackName": "scg-point-cloudtrail"
+    "GithubPath": "test/diff-check/diff-github/s3-basic.yaml",
+    "StackName": "scg-point-develop-s3-basic"
   },
   {
-    "GithubPath": "cfn/template/all/alb/alb.yaml",
-    "StackName": "scg-point-staging-alb"
+    "GithubPath": "test/diff-check/diff-github/s3-lifecycle.yaml",
+    "StackName": "scg-point-develop-s3-lifecycle"
   },
   {
-    "GithubPath": "cfn/template/account/iam/iam.yaml",
-    "StackName": "scg-point-iam"
+    "GithubPath": "test/diff-check/diff-github/s3-versioning.yaml",
+    "StackName": "scg-point-develop-s3-versioning"
   }
 ]
