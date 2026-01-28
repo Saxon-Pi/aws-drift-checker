@@ -53,6 +53,13 @@ Parameters:
     Type: String
     Default: "Asia/Tokyo"
     Description: "Timezone for scheduler (e.g., Asia/Tokyo)"
+  
+  ScheduleName:
+    Type: String
+    Description: "EventBridge Scheduler name (must be <= 64 characters)"
+    MaxLength: 64
+    AllowedPattern: "^[0-9A-Za-z-_]+$"
+    ConstraintDescription: "Use only alphanumeric characters, hyphens, and underscores (max 64 chars)."
 
 Conditions:
   HasKmsKeyArn: !Not [!Equals [!Ref DeployKeyKmsKeyArn, ""]]
