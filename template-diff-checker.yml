@@ -211,20 +211,22 @@ Resources:
                   - codebuild:StartBuild
                 Resource: !GetAtt TemplateCompareProject.Arn
 
-  DailySchedule:
-    Type: AWS::Scheduler::Schedule
-    Properties:
-      Name: !Sub "${AWS::StackName}-template-check-${GitBranch}"
-      State: ENABLED
-      ScheduleExpression: !Ref ScheduleExpression
-      ScheduleExpressionTimezone: !Ref ScheduleTimezone
-      FlexibleTimeWindow:
-        Mode: "OFF"
-      Target:
-        Arn: "arn:aws:scheduler:::aws-sdk:codebuild:startBuild"
-        RoleArn: !GetAtt SchedulerRole.Arn
-        Input: !Sub |
-          { "ProjectName": "${TemplateCompareProject}" }
+DailySchedule:
+  Type: AWS::Scheduler::Schedule
+  Properties:
+    Name: !Ref ScheduleName
+    State: ENABLED
+    ScheduleExpression: !Ref ScheduleExpression
+    ScheduleExpressionTimezone: !Ref ScheduleTimezone
+    FlexibleTimeWindow:
+      Mode: "OFF"
+    Target:
+      Arn: "arn:aws:scheduler:::aws-sdk:codebuild:startBuild"
+      RoleArn: !GetAtt SchedulerRole.Arn
+      Input: !Sub |
+        {
+          "ProjectName": "${TemplateSyncProject}"
+        }
 
 Outputs:
   SnsTopicArn:
