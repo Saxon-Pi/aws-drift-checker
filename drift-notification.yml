@@ -6,6 +6,11 @@ Parameters:
     Type: String
     Description: "Stack name of the drift detector stack (exports <StackName>-ConfigRuleName and <StackName>-SnsTopicArn)"
 
+  ExcludeStackNames:
+    Type: String
+    Default: ""
+    Description: "Comma-separated CloudFormation stack names to exclude from notification (e.g. stack-a,stack-b). Optional."
+
 Resources:
   DriftReminderFunctionRole:
     Type: AWS::IAM::Role
@@ -58,6 +63,7 @@ Resources:
             Fn::ImportValue: !Sub "${ParentStackName}-ConfigRuleName"
           SNS_TOPIC_ARN:
             Fn::ImportValue: !Sub "${ParentStackName}-SnsTopicArn"
+          EXCLUDE_STACK_NAMES: !Ref ExcludeStackNames
       Code:
         ZipFile: |
           import os
@@ -96,9 +102,39 @@ Resources:
                       break
               return results
 
+          def _parse_excludes(raw: str) -> set[str]:
+              if not raw:
+                  return set()
+              items = []
+              for part in raw.split(","):
+                  p = part.strip()
+                  if p:
+                      items.append(p)
+              return set(items)
+
+          def _stack_name_from_resource_id(resource_id: str | None) -> str | None:
+              """
+              AWS::CloudFormation::Stack の ResourceId は通常 Stack ARN:
+              arn:aws:cloudformation:<region>:<acct>:stack/<stack-name>/<id>
+              から <stack-name> を抽出する
+              """
+              if not resource_id:
+                  return None
+              if ":stack/" in resource_id:
+                  try:
+                      # split once at ':stack/' then take first segment after it
+                      after = resource_id.split(":stack/", 1)[1]
+                      # after = "<stack-name>/<id>"
+                      return after.split("/", 1)[0]
+                  except Exception:
+                      return None
+              return None
+
           def handler(event, context):
               rule_name = os.environ["CONFIG_RULE_NAME"]
               topic_arn = os.environ["SNS_TOPIC_ARN"]
+              exclude_raw = os.environ.get("EXCLUDE_STACK_NAMES", "")
+              exclude_names = _parse_excludes(exclude_raw)
 
               non_compliant = _fetch_non_compliant(rule_name)
 
@@ -106,31 +142,53 @@ Resources:
                   print(f"[OK] No NON_COMPLIANT resources for rule={rule_name}")
                   return {"status": "ok", "nonCompliantCount": 0}
 
+              # Filter by exclude stack names
+              kept = []
+              excluded = []
+              for item in non_compliant:
+                  rid = item.get("resourceId")
+                  sname = _stack_name_from_resource_id(rid)
+                  if sname and sname in exclude_names:
+                      excluded.append({**item, "stackName": sname})
+                  else:
+                      kept.append({**item, "stackName": sname})
+
+              print(f"[INFO] total={len(non_compliant)} kept={len(kept)} excluded={len(excluded)} exclude_names={sorted(exclude_names)}")
+
+              # If everything is excluded, do not notify
+              if not kept:
+                  print("[OK] All NON_COMPLIANT resources are excluded. Skipping notification.")
+                  return {"status": "ok", "nonCompliantCount": len(non_compliant), "keptCount": 0, "excludedCount": len(excluded)}
+
               now = datetime.now(timezone.utc).isoformat()
 
               lines = []
               lines.append("CloudFormation Stack のドリフト（非準拠）が検出されています。")
               lines.append(f"ConfigRuleName: {rule_name}")
               lines.append(f"CheckedAt(UTC): {now}")
+              if exclude_names:
+                  lines.append(f"ExcludedStackNames: {', '.join(sorted(exclude_names))}")
               lines.append("")
-              lines.append(f"NON_COMPLIANT resources: {len(non_compliant)}")
+              lines.append(f"NON_COMPLIANT resources (after exclude): {len(kept)}")
               lines.append("")
 
-              for i, item in enumerate(non_compliant, start=1):
+              for i, item in enumerate(kept, start=1):
+                  rid = item.get("resourceId")
+                  st = item.get("stackName")
                   lines.append(
-                      f"{i}. {item.get('resourceId')}  "
-                      f"(type={item.get('resourceType')}, recorded={item.get('resultRecordedTime')})"
+                      f"{i}. {rid}  "
+                      f"(stack={st}, type={item.get('resourceType')}, recorded={item.get('resultRecordedTime')})"
                   )
 
               message = "\n".join(lines)
 
               sns.publish(
                   TopicArn=topic_arn,
-                  Subject=f"[Drift Reminder] NON_COMPLIANT: {len(non_compliant)}",
+                  Subject=f"[Drift Reminder] NON_COMPLIANT: {len(kept)} (excluded {len(excluded)})",
                   Message=message,
               )
 
-              return {"status": "notified", "nonCompliantCount": len(non_compliant)}
+              return {"status": "notified", "keptCount": len(kept), "excludedCount": len(excluded)}
 
   DriftReminderScheduleRole:
     Type: AWS::IAM::Role
